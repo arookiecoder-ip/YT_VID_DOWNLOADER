@@ -1,0 +1,48 @@
+# Node dependencies
+node_modules/
+
+# Environment secrets (keep example file)
+.env
+.env.*
+!.env.example
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+pnpm-debug.log*
+
+# Runtime/temp files
+downloads/
+tmp/
+temp/
+*.tmp
+*.pid
+
+# Build/test artifacts
+dist/
+build/
+coverage/
+.nyc_output/
+
+# Cache
+.cache/
+.npm/
+.eslintcache
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Editor/IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Docker local overrides
+docker-compose.override.yml
+
+# Local accidental nested install folder
+/tubegrab-web-auth/

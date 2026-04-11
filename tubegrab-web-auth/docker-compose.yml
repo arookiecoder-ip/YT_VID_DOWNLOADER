@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  tubegrab:
+    build: .
+    container_name: tubegrab-web-auth
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - PORT=3000
+      - AUTH_USERNAME=${AUTH_USERNAME:-admin}
+      - AUTH_PASSWORD=${AUTH_PASSWORD:-change-me-now}
+      - AUTH_REALM=${AUTH_REALM:-TubeGrab Protected}
+    volumes:
+      - downloads:/app/downloads
+    restart: unless-stopped
+    mem_limit: 1g
+
+volumes:
+  downloads:

@@ -1,3 +1,7 @@
+tubegrab/downloads
+tubegrab/logs
+tubegrab/node_modules/
+tubegrab/bun.lock
 # Node dependencies
 node_modules/
 

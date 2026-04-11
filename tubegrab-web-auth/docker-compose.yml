@@ -12,8 +12,10 @@ services:
       - AUTH_USERNAME=${AUTH_USERNAME:-admin}
       - AUTH_PASSWORD=${AUTH_PASSWORD:-change-me-now}
       - AUTH_REALM=${AUTH_REALM:-TubeGrab Protected}
+      - YTDLP_COOKIES=/app/cookies.txt
     volumes:
       - downloads:/app/downloads
+      - ./cookies.txt:/app/cookies.txt:ro
     restart: unless-stopped
     mem_limit: 1g
 

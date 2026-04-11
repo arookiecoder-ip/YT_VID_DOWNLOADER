@@ -12,6 +12,7 @@ require("dotenv").config();
 const app = express();
 const PORT = process.env.PORT || 3000;
 const YT_DLP = process.env.YT_DLP_PATH || "yt-dlp";
+const YTDLP_COOKIES = process.env.YTDLP_COOKIES || "";
 const AUTH_USERNAME = process.env.AUTH_USERNAME || "admin";
 const AUTH_PASSWORD = process.env.AUTH_PASSWORD || "change-me-now";
 const AUTH_REALM = process.env.AUTH_REALM || "TubeGrab Protected";
@@ -210,11 +211,18 @@ function isPlaylistURL(url) {
   return /[?&]list=[\w-]+/.test(String(url || ""));
 }
 
+function withCookies(args) {
+  if (YTDLP_COOKIES && fs.existsSync(YTDLP_COOKIES)) {
+    return ["--cookies", YTDLP_COOKIES, ...args];
+  }
+  return args;
+}
+
 function runYtDlp(args) {
   return new Promise((resolve, reject) => {
     execFile(
       YT_DLP,
-      args,
+      withCookies(args),
       { timeout: 90000, maxBuffer: 20 * 1024 * 1024 },
       (err, stdout, stderr) => {
         if (err) {
@@ -697,7 +705,7 @@ async function streamDownload(req, res) {
 
     if (needsTempMergedFile) {
       tempPath = createTempDownloadPath(outputExt);
-      const args = buildDownloadArgs(formatId, isAudio, tempPath);
+      const args = withCookies(buildDownloadArgs(formatId, isAudio, tempPath));
       args.push(url);
 
       await new Promise((resolve, reject) => {
@@ -769,7 +777,7 @@ async function streamDownload(req, res) {
       return;
     }
 
-    const args = buildDownloadArgs(formatId, isAudio, "-");
+    const args = withCookies(buildDownloadArgs(formatId, isAudio, "-"));
     args.push(url);
 
     res.set({

@@ -210,6 +210,12 @@ function isPlaylistURL(url) {
   return /[?&]list=[\w-]+/.test(String(url || ""));
 }
 
+function hasVideoId(url) {
+  return /[?&]v=[\w-]{11}(&|$)/.test(String(url || "")) ||
+         /\/shorts\/[\w-]{11}/.test(String(url || "")) ||
+         /youtu\.be\/[\w-]{11}/.test(String(url || ""));
+}
+
 function runYtDlp(args) {
   return new Promise((resolve, reject) => {
     execFile(
@@ -559,7 +565,7 @@ app.get("/api/info", async (req, res) => {
   }
 
   try {
-    if (isPlaylistURL(url)) {
+    if (isPlaylistURL(url) && !hasVideoId(url)) {
       const rawPlaylist = await runYtDlp([
         "--dump-single-json",
         "--flat-playlist",

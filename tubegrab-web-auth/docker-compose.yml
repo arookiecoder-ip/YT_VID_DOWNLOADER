@@ -15,7 +15,7 @@ services:
       - YTDLP_COOKIES=/app/cookies.txt
     volumes:
       - downloads:/app/downloads
-      - ./cookies.txt:/app/cookies.txt:ro
+      - ./cookies.txt:/app/cookies.txt
     restart: unless-stopped
     mem_limit: 1g
 

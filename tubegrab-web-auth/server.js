@@ -249,6 +249,10 @@ function toPositiveInt(value) {
   return Number.isFinite(parsed) && parsed > 0 ? parsed : null;
 }
 
+function isH264(vcodec) {
+  return typeof vcodec === "string" && vcodec.startsWith("avc1");
+}
+
 function parseFormats(rawFormats) {
   const byHeight = new Map(); // height -> { progressive, adaptive }
 
@@ -267,18 +271,19 @@ function parseFormats(rawFormats) {
     const hasAudio = format.acodec && format.acodec !== "none";
 
     if (hasAudio) {
-      // Prefer MP4 progressive where possible for better compatibility.
-      if (
-        !slot.progressive ||
-        (slot.progressive.ext !== "mp4" && format.ext === "mp4")
-      ) {
+      // Prefer H.264 MP4 progressive for maximum compatibility (no AV1/VP9).
+      const cur = slot.progressive;
+      const betterCodec = !cur || (!isH264(cur.vcodec) && isH264(format.vcodec));
+      const betterExt = cur && cur.ext !== "mp4" && format.ext === "mp4";
+      if (!cur || betterCodec || betterExt) {
         slot.progressive = format;
       }
     } else {
-      if (
-        !slot.adaptive ||
-        (slot.adaptive.ext !== "mp4" && format.ext === "mp4")
-      ) {
+      // Prefer H.264 adaptive video track.
+      const cur = slot.adaptive;
+      const betterCodec = !cur || (!isH264(cur.vcodec) && isH264(format.vcodec));
+      const betterExt = cur && cur.ext !== "mp4" && format.ext === "mp4";
+      if (!cur || betterCodec || betterExt) {
         slot.adaptive = format;
       }
     }
@@ -310,9 +315,12 @@ function parseFormats(rawFormats) {
 
     if (slot.adaptive) {
       const format = slot.adaptive;
+      // Force H.264 + M4A audio — universally compatible, no AV1/VP9
       videoFormats.push({
         id:
-          "bestvideo[height=" +
+          "bestvideo[vcodec^=avc1][height=" +
+          height +
+          "]+bestaudio[ext=m4a]/bestvideo[vcodec^=avc1][height<=" +
           height +
           "]+bestaudio[ext=m4a]/bestvideo[height<=" +
           height +

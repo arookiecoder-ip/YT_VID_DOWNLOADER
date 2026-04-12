@@ -554,7 +554,11 @@ function buildDownloadArgs(formatId, isAudio, outputTarget = "-") {
 
   args.push("-f", selector);
   if (selector.includes("+")) {
-    args.push("--merge-output-format", "mp4");
+    args.push(
+      "--merge-output-format", "mp4",
+      "--recode-video", "mp4",
+      "--postprocessor-args", "ffmpeg:-c:v libx264 -c:a aac -movflags +faststart",
+    );
   }
   args.push("-o", outputTarget);
   return args;
@@ -684,21 +688,15 @@ async function streamDownload(req, res) {
   const isAudio = ext === "mp3" || formatId === "bestaudio";
   const selector = getFormatSelector(formatId, isAudio);
   const needsTempMergedFile = !isAudio && selector.includes("+");
-  const outputExt = isAudio
-    ? "mp3"
-    : needsTempMergedFile
-      ? "mp4"
-      : ext || "mp4";
-  const contentType = outputExt === "webm" ? "video/webm" : "video/mp4";
+  const outputExt = isAudio ? "mp3" : "mp4";
+  const contentType = "video/mp4";
   let tempPath = null;
 
   try {
-    const sizeMeta = await probeDownloadSize(url, formatId, isAudio);
-    const titleRaw = await runYtDlp([
-      "--get-title",
-      "--no-warnings",
-      "--no-playlist",
-      url,
+    // Fetch title and size in parallel to reduce startup delay
+    const [titleRaw, sizeMeta] = await Promise.all([
+      runYtDlp(["--get-title", "--no-warnings", "--no-playlist", url]),
+      probeDownloadSize(url, formatId, isAudio),
     ]);
     const safeTitle = sanitizeFilename(titleRaw);
     const filename = safeTitle + "." + outputExt;

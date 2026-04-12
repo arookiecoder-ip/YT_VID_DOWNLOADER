@@ -584,6 +584,160 @@
       animation: fadeSlideUp 0.8s ease-out 0.3s both;
     }
 
+    /* ── Downloads Tray ── */
+    .dl-tray {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      width: 340px;
+      z-index: 200;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      pointer-events: none;
+    }
+
+    .dl-tray-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 10px 14px;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      font-size: 0.78rem;
+      font-weight: 600;
+      color: var(--text-dim);
+      pointer-events: all;
+      cursor: pointer;
+      user-select: none;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .dl-tray-header:hover {
+      border-color: var(--text-dimmer);
+    }
+
+    .dl-tray-badge {
+      background: var(--accent);
+      color: #fff;
+      font-size: 0.65rem;
+      font-weight: 700;
+      padding: 2px 7px;
+      border-radius: 20px;
+      min-width: 20px;
+      text-align: center;
+    }
+
+    .dl-tray-list {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+      max-height: 420px;
+      overflow-y: auto;
+      pointer-events: all;
+    }
+
+    .dl-tray-list.collapsed {
+      display: none;
+    }
+
+    .dl-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 12px 14px;
+      animation: fadeSlideUp 0.3s ease-out;
+      pointer-events: all;
+    }
+
+    .dl-card.done {
+      border-color: rgba(51, 255, 153, 0.25);
+    }
+
+    .dl-card.failed {
+      border-color: rgba(255, 51, 102, 0.25);
+    }
+
+    .dl-card-top {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+
+    .dl-card-title {
+      flex: 1;
+      font-size: 0.78rem;
+      font-weight: 600;
+      line-height: 1.35;
+      display: -webkit-box;
+      -webkit-line-clamp: 2;
+      -webkit-box-orient: vertical;
+      overflow: hidden;
+      color: var(--text);
+    }
+
+    .dl-card-dismiss {
+      background: none;
+      border: none;
+      color: var(--text-dimmer);
+      cursor: pointer;
+      font-size: 1rem;
+      line-height: 1;
+      padding: 0 2px;
+      flex-shrink: 0;
+    }
+
+    .dl-card-dismiss:hover {
+      color: var(--text);
+    }
+
+    .dl-card-bar-outer {
+      width: 100%;
+      height: 5px;
+      background: var(--surface-3);
+      border-radius: 4px;
+      overflow: hidden;
+      margin-bottom: 6px;
+    }
+
+    .dl-card-bar-inner {
+      height: 100%;
+      width: 0%;
+      background: linear-gradient(90deg, var(--accent), var(--accent-2));
+      border-radius: 4px;
+      transition: width 0.3s;
+    }
+
+    .dl-card.done .dl-card-bar-inner {
+      background: var(--success);
+    }
+
+    .dl-card.failed .dl-card-bar-inner {
+      background: var(--accent);
+    }
+
+    .dl-card-status {
+      font-size: 0.7rem;
+      color: var(--text-dim);
+      font-family: var(--mono);
+      display: flex;
+      justify-content: space-between;
+    }
+
+    .dl-card-status .status-ok { color: var(--success); }
+    .dl-card-status .status-err { color: #ff6688; }
+
+    @media (max-width: 520px) {
+      .dl-tray {
+        right: 12px;
+        bottom: 12px;
+        width: calc(100vw - 24px);
+      }
+    }
+
     .toast {
       position: fixed;
       bottom: 28px;
@@ -741,12 +895,6 @@
         <div class="format-label">Select Quality</div>
         <div class="format-grid" id="formatGrid"></div>
       </div>
-      <div class="progress-wrap" id="progressWrap">
-        <div class="progress-bar-outer">
-          <div class="progress-bar-inner" id="progressBar"></div>
-        </div>
-        <div class="progress-info"><span id="progressPercent">0%</span><span id="progressSize">—</span></div>
-      </div>
       <div class="download-section">
         <button class="btn-download" id="downloadBtn" onclick="startDownload()">
           <svg viewBox="0 0 24 24">
@@ -762,6 +910,16 @@
       Respect copyright laws and YouTube's Terms of Service.
     </footer>
   </div>
+
+  <!-- Downloads Tray -->
+  <div class="dl-tray" id="dlTray" style="display:none;">
+    <div class="dl-tray-header" onclick="toggleTray()">
+      <span>Downloads</span>
+      <span class="dl-tray-badge" id="dlTrayBadge">0</span>
+    </div>
+    <div class="dl-tray-list" id="dlTrayList"></div>
+  </div>
+
   <div class="toast" id="toast"></div>
 
   <script>
@@ -989,6 +1147,84 @@
       setTimeout(() => iframe.remove(), 120000);
     }
 
+    // ── Downloads Tray ──
+    let trayCollapsed = false;
+
+    function toggleTray() {
+      trayCollapsed = !trayCollapsed;
+      document.getElementById('dlTrayList').classList.toggle('collapsed', trayCollapsed);
+    }
+
+    function createTrayCard(title, filename) {
+      const id = 'dlcard-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7);
+      const tray = document.getElementById('dlTray');
+      const list = document.getElementById('dlTrayList');
+
+      const card = document.createElement('div');
+      card.className = 'dl-card';
+      card.id = id;
+      card.innerHTML = `
+        <div class="dl-card-top">
+          <div class="dl-card-title">${title.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>
+          <button class="dl-card-dismiss" title="Dismiss" onclick="dismissTrayCard('${id}')" style="display:none">✕</button>
+        </div>
+        <div class="dl-card-bar-outer"><div class="dl-card-bar-inner" id="${id}-bar"></div></div>
+        <div class="dl-card-status"><span id="${id}-pct">Waiting…</span><span id="${id}-size">${filename}</span></div>
+      `;
+
+      list.appendChild(card);
+      tray.style.display = 'flex';
+      if (trayCollapsed) {
+        trayCollapsed = false;
+        document.getElementById('dlTrayList').classList.remove('collapsed');
+      }
+      updateTrayBadge();
+      return id;
+    }
+
+    function updateTrayCard(id, pct, statusText, sizeText) {
+      const bar = document.getElementById(id + '-bar');
+      const pctEl = document.getElementById(id + '-pct');
+      const sizeEl = document.getElementById(id + '-size');
+      if (bar) bar.style.width = Math.max(0, Math.min(100, pct)) + '%';
+      if (pctEl) pctEl.textContent = statusText;
+      if (sizeEl && sizeText !== undefined) sizeEl.textContent = sizeText;
+    }
+
+    function finishTrayCard(id, success, message) {
+      const card = document.getElementById(id);
+      if (!card) return;
+      card.classList.add(success ? 'done' : 'failed');
+      const bar = document.getElementById(id + '-bar');
+      if (bar) bar.style.width = success ? '100%' : '100%';
+      const pctEl = document.getElementById(id + '-pct');
+      if (pctEl) {
+        pctEl.innerHTML = success
+          ? `<span class="status-ok">✓ Done</span>`
+          : `<span class="status-err">✕ Failed</span>`;
+      }
+      const sizeEl = document.getElementById(id + '-size');
+      if (sizeEl && message) sizeEl.textContent = message;
+      const btn = card.querySelector('.dl-card-dismiss');
+      if (btn) btn.style.display = '';
+      updateTrayBadge();
+    }
+
+    function dismissTrayCard(id) {
+      const card = document.getElementById(id);
+      if (card) card.remove();
+      updateTrayBadge();
+      if (!document.getElementById('dlTrayList').children.length) {
+        document.getElementById('dlTray').style.display = 'none';
+      }
+    }
+
+    function updateTrayBadge() {
+      const list = document.getElementById('dlTrayList');
+      const badge = document.getElementById('dlTrayBadge');
+      badge.textContent = list ? list.children.length : 0;
+    }
+
     async function startPlaylistDownload(formatId, ext) {
       const entries = Array.isArray(currentVideo?.entries) ? currentVideo.entries : [];
       if (!entries.length) {
@@ -1001,17 +1237,12 @@
       }
 
       const btn = document.getElementById('downloadBtn');
-      const progressWrap = document.getElementById('progressWrap');
-      const progressBar = document.getElementById('progressBar');
-      const progressPercent = document.getElementById('progressPercent');
-      const progressSize = document.getElementById('progressSize');
+      const playlistTitle = currentVideo.title || 'Playlist';
+      const cardId = createTrayCard(playlistTitle, `${entries.length} videos`);
 
       btn.disabled = true;
       btn.querySelector('span').textContent = 'Queueing…';
-      progressWrap.classList.add('active');
-      progressBar.style.width = '0%';
-      progressPercent.textContent = '0%';
-      progressSize.textContent = `Queued 0 / ${entries.length}`;
+      updateTrayCard(cardId, 0, 'Queueing…', `0 / ${entries.length}`);
 
       for (let i = 0; i < entries.length; i += 1) {
         const item = entries[i];
@@ -1023,9 +1254,7 @@
         queueIframeDownload(params);
 
         const pct = Math.round(((i + 1) / entries.length) * 100);
-        progressBar.style.width = `${pct}%`;
-        progressPercent.textContent = `${pct}%`;
-        progressSize.textContent = `Queued ${i + 1} / ${entries.length}`;
+        updateTrayCard(cardId, pct, `Queued ${i + 1} / ${entries.length}`, '');
 
         if (i < entries.length - 1) {
           await new Promise(resolve => setTimeout(resolve, 180));
@@ -1034,6 +1263,7 @@
 
       btn.disabled = false;
       btn.querySelector('span').textContent = getDefaultDownloadButtonLabel();
+      finishTrayCard(cardId, true, `${entries.length} videos queued`);
       showToast(`Queued ${entries.length} videos. Allow multiple downloads if prompted.`);
     }
 
@@ -1128,11 +1358,6 @@
         return;
       }
 
-      const btn = document.getElementById('downloadBtn');
-      const progressWrap = document.getElementById('progressWrap');
-      const progressBar = document.getElementById('progressBar');
-      const progressPercent = document.getElementById('progressPercent');
-      const progressSize = document.getElementById('progressSize');
       const selectedFmt = currentVideo.formats.find(f => f.id === selectedFormat) || {};
       const ext = selectedFmt.ext || (selectedFmt.type === 'audio' ? 'mp3' : 'mp4');
 
@@ -1148,29 +1373,23 @@
       });
 
       const knownBytes = selectedFmt.filesize || selectedFmt.filesizeApprox || null;
-      const sizeExact = selectedFmt.sizeExact || false;
-      const sizeLabel = knownBytes
-        ? `${sizeExact ? 'Exact' : 'Estimated'}: ${formatBytes(knownBytes)}`
-        : 'Size unavailable';
-
       const suggestedFilename = `${sanitizeClientFilename(currentVideo.title || 'video')}.${ext}`;
+      const videoTitle = currentVideo.title || 'Untitled';
 
       // If File System Access API is not supported, fall back to iframe immediately
       if (typeof window.showSaveFilePicker !== 'function') {
-        progressWrap.classList.add('active');
+        const cardId = createTrayCard(videoTitle, suggestedFilename);
         activeDownloads++;
         queueIframeDownload(params);
-        setProgressState(progressBar, progressPercent, progressSize, 100, 'Started in browser', 'Check your browser downloads bar');
-        showToast(knownBytes
-          ? `Download started (${sizeLabel}). You can start another now.`
-          : 'Download started. You can start another now.'
-        );
+        updateTrayCard(cardId, 100, 'Started in browser', 'Check your downloads bar');
+        finishTrayCard(cardId, true, 'Check your downloads bar');
+        showToast('Download started — check your browser downloads bar.');
         setTimeout(() => { activeDownloads = Math.max(0, activeDownloads - 1); }, 120000);
         return;
       }
 
-      // Show the file picker IMMEDIATELY — must be synchronous within the click handler
-      // to satisfy browser user-gesture requirement. No awaits before this point.
+      // Show the file picker IMMEDIATELY — must happen within the click gesture.
+      // No awaits allowed before this point.
       let fileHandle;
       try {
         fileHandle = await window.showSaveFilePicker({
@@ -1181,23 +1400,21 @@
           }],
         });
       } catch (err) {
-        if (err && err.name === 'AbortError') {
-          return; // user cancelled picker — do nothing
-        }
-        // picker failed for another reason — fall back to iframe
-        progressWrap.classList.add('active');
+        if (err && err.name === 'AbortError') return; // user cancelled
+        // Picker failed — fallback to iframe
+        const cardId = createTrayCard(videoTitle, suggestedFilename);
         activeDownloads++;
         queueIframeDownload(params);
-        setProgressState(progressBar, progressPercent, progressSize, 100, 'Started in browser', 'Check your browser downloads bar');
+        updateTrayCard(cardId, 100, 'Started in browser', 'Check your downloads bar');
+        finishTrayCard(cardId, true, 'Check your downloads bar');
         showToast('Folder picker unavailable, using browser download instead.');
         setTimeout(() => { activeDownloads = Math.max(0, activeDownloads - 1); }, 120000);
         return;
       }
 
-      // User picked a location — now do all the async server work
-      progressWrap.classList.add('active');
-      btn.querySelector('span').textContent = 'Preparing…';
-      setProgressState(progressBar, progressPercent, progressSize, 25, 'Merging on server…', 'Step 1/2: Preparing video + audio tracks');
+      // User picked a save location — create tray card and start async work.
+      // The main card is now free to be reused for a new video search.
+      const cardId = createTrayCard(videoTitle, suggestedFilename);
       activeDownloads++;
 
       let writable = null;
@@ -1205,10 +1422,11 @@
       try {
         writable = await fileHandle.createWritable();
 
-        let prepPct = 25;
+        let prepPct = 10;
+        updateTrayCard(cardId, prepPct, 'Merging on server…', '');
         prepTicker = setInterval(() => {
-          prepPct = Math.min(prepPct + 2, 88);
-          setProgressState(progressBar, progressPercent, progressSize, prepPct, 'Merging on server…', 'Step 1/2: Preparing video + audio tracks');
+          prepPct = Math.min(prepPct + 2, 85);
+          updateTrayCard(cardId, prepPct, 'Merging on server…', '');
         }, 900);
 
         const res = await fetch(`${API_BASE}/api/download?${params.toString()}`);
@@ -1225,8 +1443,8 @@
         if (!reader) throw new Error('Streaming not supported in this browser.');
 
         let received = 0;
-        setProgressState(progressBar, progressPercent, progressSize, 90, 'Downloading…',
-          total > 0 ? `Step 2/2: 0 B / ${formatBytes(total)}` : 'Step 2/2: Total size unavailable');
+        updateTrayCard(cardId, 88, 'Downloading…',
+          total > 0 ? `0 B / ${formatBytes(total)}` : '');
 
         while (true) {
           const { done, value } = await reader.read();
@@ -1235,26 +1453,24 @@
           received += value.byteLength || value.length || 0;
           if (total > 0) {
             const pct = Math.min(100, Math.round((received / total) * 100));
-            const uiPct = Math.min(100, Math.round(90 + (pct * 0.1)));
-            setProgressState(progressBar, progressPercent, progressSize, uiPct,
-              `Downloading… ${pct}%`, `Step 2/2: ${formatBytes(received)} / ${formatBytes(total)}`);
+            const uiPct = Math.min(99, Math.round(88 + (pct * 0.11)));
+            updateTrayCard(cardId, uiPct, `Downloading ${pct}%`,
+              `${formatBytes(received)} / ${formatBytes(total)}`);
           } else {
-            setProgressState(progressBar, progressPercent, progressSize, 95, 'Downloading…',
-              `Step 2/2: Received ${formatBytes(received)}`);
+            updateTrayCard(cardId, 94, 'Downloading…', formatBytes(received));
           }
         }
 
-        setProgressState(progressBar, progressPercent, progressSize, 100, 'Completed', `Saved to: ${suggestedFilename}`);
         await writable.close();
-        showToast('Download complete!');
+        finishTrayCard(cardId, true, suggestedFilename);
+        showToast(`Done: ${videoTitle.slice(0, 40)}`);
       } catch (err) {
         if (prepTicker) { clearInterval(prepTicker); prepTicker = null; }
         if (writable) { try { await writable.abort(); } catch (_) { } }
-        showToast('Download failed: ' + (err.message || 'Unknown error').slice(0, 80), 'error');
-        progressWrap.classList.remove('active');
+        finishTrayCard(cardId, false, (err.message || 'Unknown error').slice(0, 60));
+        showToast('Download failed: ' + (err.message || 'Unknown error').slice(0, 60), 'error');
       } finally {
         activeDownloads = Math.max(0, activeDownloads - 1);
-        btn.querySelector('span').textContent = getDefaultDownloadButtonLabel();
       }
     }
   </script>

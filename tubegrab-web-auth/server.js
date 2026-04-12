@@ -825,9 +825,8 @@ async function streamDownload(req, res) {
         if (line) console.error("[/api/download]", line);
       });
 
-      req.on("close", () => {
-        if (!proc.killed) proc.kill("SIGTERM");
-      });
+      // Do NOT kill yt-dlp on req close — the client connection drops briefly
+      // while the file picker is open. Let the download finish to temp file first.
 
       proc.on("close", (code) => {
         if (code === 0) { resolve(); return; }

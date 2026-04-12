@@ -441,6 +441,10 @@ function sanitizeFilename(name) {
   return (
     String(name || "video")
       .replace(/[\\/:*?"<>|]/g, "")
+      // Strip non-ASCII characters (emojis, fancy Unicode) — they break HTTP headers
+      // The filename*= RFC 5987 encoded version handles Unicode for modern browsers
+      // eslint-disable-next-line no-control-regex
+      .replace(/[^\x00-\x7F]/g, "")
       .replace(/\s+/g, " ")
       .trim()
       .slice(0, 120) || "video"
@@ -735,31 +739,27 @@ async function streamDownload(req, res) {
         throw new Error("Merged output was not generated.");
       }
 
-      // Re-encode to H.264+AAC for universal browser compatibility
-      const recodedPath = createTempDownloadPath(outputExt);
+      // Remux to MP4 with faststart using stream copy (no re-encode — fast, no quality loss)
+      const remuxedPath = createTempDownloadPath(outputExt);
       await new Promise((resolve, reject) => {
         const proc = spawn("ffmpeg", [
           "-i", tempPath,
-          "-c:v", "libx264",
-          "-preset", "fast",
-          "-crf", "23",
-          "-c:a", "aac",
-          "-b:a", "192k",
+          "-c", "copy",
           "-movflags", "+faststart",
           "-y",
-          recodedPath,
+          remuxedPath,
         ], { stdio: ["ignore", "pipe", "pipe"] });
         let stderr = "";
         proc.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
         proc.on("close", (code) => {
           removeFileQuietly(tempPath);
           if (code === 0) { resolve(); return; }
-          removeFileQuietly(recodedPath);
-          reject(new Error("ffmpeg re-encode failed: " + stderr.slice(-300)));
+          removeFileQuietly(remuxedPath);
+          reject(new Error("ffmpeg remux failed: " + stderr.slice(-300)));
         });
         proc.on("error", reject);
       });
-      tempPath = recodedPath;
+      tempPath = remuxedPath;
 
       if (!fs.existsSync(tempPath)) {
         throw new Error("Re-encoded output was not generated.");

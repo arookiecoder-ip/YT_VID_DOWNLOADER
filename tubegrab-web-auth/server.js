@@ -554,11 +554,7 @@ function buildDownloadArgs(formatId, isAudio, outputTarget = "-") {
 
   args.push("-f", selector);
   if (selector.includes("+")) {
-    args.push(
-      "--merge-output-format", "mp4",
-      "--recode-video", "mp4",
-      "--postprocessor-args", "ffmpeg:-c:v libx264 -c:a aac -movflags +faststart",
-    );
+    args.push("--merge-output-format", "mp4");
   }
   args.push("-o", outputTarget);
   return args;
@@ -704,11 +700,11 @@ async function streamDownload(req, res) {
 
     if (needsTempMergedFile) {
       tempPath = createTempDownloadPath(outputExt);
-      const args = withCookies(buildDownloadArgs(formatId, isAudio, tempPath));
-      args.push(url);
+      const ytdlpArgs = withCookies(buildDownloadArgs(formatId, isAudio, tempPath));
+      ytdlpArgs.push(url);
 
       await new Promise((resolve, reject) => {
-        const proc = spawn(YT_DLP, args, { stdio: ["ignore", "pipe", "pipe"] });
+        const proc = spawn(YT_DLP, ytdlpArgs, { stdio: ["ignore", "pipe", "pipe"] });
         let stderr = "";
 
         proc.stderr.on("data", (chunk) => {
@@ -735,6 +731,36 @@ async function streamDownload(req, res) {
 
       if (!fs.existsSync(tempPath)) {
         throw new Error("Merged output was not generated.");
+      }
+
+      // Re-encode to H.264+AAC for universal browser compatibility
+      const recodedPath = createTempDownloadPath(outputExt);
+      await new Promise((resolve, reject) => {
+        const proc = spawn("ffmpeg", [
+          "-i", tempPath,
+          "-c:v", "libx264",
+          "-preset", "fast",
+          "-crf", "23",
+          "-c:a", "aac",
+          "-b:a", "192k",
+          "-movflags", "+faststart",
+          "-y",
+          recodedPath,
+        ], { stdio: ["ignore", "pipe", "pipe"] });
+        let stderr = "";
+        proc.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+        proc.on("close", (code) => {
+          removeFileQuietly(tempPath);
+          if (code === 0) { resolve(); return; }
+          removeFileQuietly(recodedPath);
+          reject(new Error("ffmpeg re-encode failed: " + stderr.slice(-300)));
+        });
+        proc.on("error", reject);
+      });
+      tempPath = recodedPath;
+
+      if (!fs.existsSync(tempPath)) {
+        throw new Error("Re-encoded output was not generated.");
       }
 
       const stat = fs.statSync(tempPath);

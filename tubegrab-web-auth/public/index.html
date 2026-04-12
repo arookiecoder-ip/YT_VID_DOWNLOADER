@@ -968,7 +968,7 @@
         }
 
         console.warn('File picker download failed:', err);
-        return { supported: true, completed: false, cancelled: false };
+        return { supported: true, completed: false, cancelled: false, error: err.message || 'Unknown error' };
       }
     }
 
@@ -1177,6 +1177,7 @@
 
       if (pickerResult.cancelled) {
         showToast('Download cancelled', 'error');
+        progressWrap.classList.remove('active');
         return;
       }
 
@@ -1185,10 +1186,16 @@
         return;
       }
 
-      // Fallback: browser-native download via hidden iframe (no progress, but non-blocking)
+      if (pickerResult.error) {
+        showToast('Download failed: ' + pickerResult.error.slice(0, 80), 'error');
+        progressWrap.classList.remove('active');
+        return;
+      }
+
+      // File picker not supported — fallback to browser-native download via hidden iframe
       activeDownloads++;
       queueIframeDownload(params);
-      setProgressState(progressBar, progressPercent, progressSize, 100, 'Started in browser', 'Downloading in background — you can start another');
+      setProgressState(progressBar, progressPercent, progressSize, 100, 'Started in browser', 'Check your browser downloads bar');
       showToast(knownBytes
         ? `Download started (${sizeLabel}). You can start another now.`
         : 'Download started. You can start another now.'

@@ -1147,60 +1147,115 @@
         ext,
       });
 
-      // Use size already known from /api/info — no extra network call needed
       const knownBytes = selectedFmt.filesize || selectedFmt.filesizeApprox || null;
       const sizeExact = selectedFmt.sizeExact || false;
       const sizeLabel = knownBytes
         ? `${sizeExact ? 'Exact' : 'Estimated'}: ${formatBytes(knownBytes)}`
         : 'Size unavailable';
 
-      progressWrap.classList.add('active');
-      setProgressState(progressBar, progressPercent, progressSize, 20, 'Ready', sizeLabel);
-
       const suggestedFilename = `${sanitizeClientFilename(currentVideo.title || 'video')}.${ext}`;
-      btn.querySelector('span').textContent = 'Choose folder…';
-      setProgressState(progressBar, progressPercent, progressSize, 25, 'Waiting for folder…', 'Choose where to save the file');
-      showToast('Pick your file location. Download starts after server prep.');
 
-      activeDownloads++;
-      const pickerResult = await tryDownloadWithFilePicker(
-        params,
-        suggestedFilename,
-        ext,
-        progressBar,
-        progressPercent,
-        progressSize
-      );
-      activeDownloads = Math.max(0, activeDownloads - 1);
-
-      btn.querySelector('span').textContent = getDefaultDownloadButtonLabel();
-
-      if (pickerResult.cancelled) {
-        showToast('Download cancelled', 'error');
-        progressWrap.classList.remove('active');
+      // If File System Access API is not supported, fall back to iframe immediately
+      if (typeof window.showSaveFilePicker !== 'function') {
+        progressWrap.classList.add('active');
+        activeDownloads++;
+        queueIframeDownload(params);
+        setProgressState(progressBar, progressPercent, progressSize, 100, 'Started in browser', 'Check your browser downloads bar');
+        showToast(knownBytes
+          ? `Download started (${sizeLabel}). You can start another now.`
+          : 'Download started. You can start another now.'
+        );
+        setTimeout(() => { activeDownloads = Math.max(0, activeDownloads - 1); }, 120000);
         return;
       }
 
-      if (pickerResult.completed) {
+      // Show the file picker IMMEDIATELY — must be synchronous within the click handler
+      // to satisfy browser user-gesture requirement. No awaits before this point.
+      let fileHandle;
+      try {
+        fileHandle = await window.showSaveFilePicker({
+          suggestedName: suggestedFilename,
+          types: [{
+            description: `${ext.toUpperCase()} file`,
+            accept: { [mimeForExt(ext)]: [`.${ext}`] }
+          }],
+        });
+      } catch (err) {
+        if (err && err.name === 'AbortError') {
+          return; // user cancelled picker — do nothing
+        }
+        // picker failed for another reason — fall back to iframe
+        progressWrap.classList.add('active');
+        activeDownloads++;
+        queueIframeDownload(params);
+        setProgressState(progressBar, progressPercent, progressSize, 100, 'Started in browser', 'Check your browser downloads bar');
+        showToast('Folder picker unavailable, using browser download instead.');
+        setTimeout(() => { activeDownloads = Math.max(0, activeDownloads - 1); }, 120000);
+        return;
+      }
+
+      // User picked a location — now do all the async server work
+      progressWrap.classList.add('active');
+      btn.querySelector('span').textContent = 'Preparing…';
+      setProgressState(progressBar, progressPercent, progressSize, 25, 'Merging on server…', 'Step 1/2: Preparing video + audio tracks');
+      activeDownloads++;
+
+      let writable = null;
+      let prepTicker = null;
+      try {
+        writable = await fileHandle.createWritable();
+
+        let prepPct = 25;
+        prepTicker = setInterval(() => {
+          prepPct = Math.min(prepPct + 2, 88);
+          setProgressState(progressBar, progressPercent, progressSize, prepPct, 'Merging on server…', 'Step 1/2: Preparing video + audio tracks');
+        }, 900);
+
+        const res = await fetch(`${API_BASE}/api/download?${params.toString()}`);
+        clearInterval(prepTicker);
+        prepTicker = null;
+
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          throw new Error(errData.error || `Server error ${res.status}`);
+        }
+
+        const total = Number(res.headers.get('Content-Length') || 0);
+        const reader = res.body && res.body.getReader ? res.body.getReader() : null;
+        if (!reader) throw new Error('Streaming not supported in this browser.');
+
+        let received = 0;
+        setProgressState(progressBar, progressPercent, progressSize, 90, 'Downloading…',
+          total > 0 ? `Step 2/2: 0 B / ${formatBytes(total)}` : 'Step 2/2: Total size unavailable');
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          await writable.write(value);
+          received += value.byteLength || value.length || 0;
+          if (total > 0) {
+            const pct = Math.min(100, Math.round((received / total) * 100));
+            const uiPct = Math.min(100, Math.round(90 + (pct * 0.1)));
+            setProgressState(progressBar, progressPercent, progressSize, uiPct,
+              `Downloading… ${pct}%`, `Step 2/2: ${formatBytes(received)} / ${formatBytes(total)}`);
+          } else {
+            setProgressState(progressBar, progressPercent, progressSize, 95, 'Downloading…',
+              `Step 2/2: Received ${formatBytes(received)}`);
+          }
+        }
+
+        setProgressState(progressBar, progressPercent, progressSize, 100, 'Completed', `Saved to: ${suggestedFilename}`);
+        await writable.close();
         showToast('Download complete!');
-        return;
-      }
-
-      if (pickerResult.error) {
-        showToast('Download failed: ' + pickerResult.error.slice(0, 80), 'error');
+      } catch (err) {
+        if (prepTicker) { clearInterval(prepTicker); prepTicker = null; }
+        if (writable) { try { await writable.abort(); } catch (_) { } }
+        showToast('Download failed: ' + (err.message || 'Unknown error').slice(0, 80), 'error');
         progressWrap.classList.remove('active');
-        return;
+      } finally {
+        activeDownloads = Math.max(0, activeDownloads - 1);
+        btn.querySelector('span').textContent = getDefaultDownloadButtonLabel();
       }
-
-      // File picker not supported — fallback to browser-native download via hidden iframe
-      activeDownloads++;
-      queueIframeDownload(params);
-      setProgressState(progressBar, progressPercent, progressSize, 100, 'Started in browser', 'Check your browser downloads bar');
-      showToast(knownBytes
-        ? `Download started (${sizeLabel}). You can start another now.`
-        : 'Download started. You can start another now.'
-      );
-      setTimeout(() => { activeDownloads = Math.max(0, activeDownloads - 1); }, 120000);
     }
   </script>
 </body>

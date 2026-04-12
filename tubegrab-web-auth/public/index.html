@@ -1418,34 +1418,61 @@
       activeDownloads++;
 
       let writable = null;
-      let prepTicker = null;
       try {
         writable = await fileHandle.createWritable();
 
-        let prepPct = 10;
-        updateTrayCard(cardId, prepPct, 'Merging on server…', '');
-        prepTicker = setInterval(() => {
-          prepPct = Math.min(prepPct + 2, 85);
-          updateTrayCard(cardId, prepPct, 'Merging on server…', '');
-        }, 900);
+        // Phase 1: start the background job — returns a token immediately
+        // (well within Cloudflare's 100s proxy timeout).
+        updateTrayCard(cardId, 2, 'Starting…', '');
+        const startRes = await fetch(`${API_BASE}/api/download/start`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            url: currentVideo.url,
+            formatId: selectedFormat,
+            ext,
+          }),
+        });
+        if (!startRes.ok) {
+          const errData = await startRes.json().catch(() => ({}));
+          throw new Error(errData.error || `Server error ${startRes.status}`);
+        }
+        const { token } = await startRes.json();
 
-        const res = await fetch(`${API_BASE}/api/download?${params.toString()}`);
-        clearInterval(prepTicker);
-        prepTicker = null;
+        // Phase 2: poll status until done or error
+        await new Promise((resolve, reject) => {
+          const poll = async () => {
+            try {
+              const statusRes = await fetch(`${API_BASE}/api/download/status/${token}`);
+              if (!statusRes.ok) {
+                const e = await statusRes.json().catch(() => ({}));
+                return reject(new Error(e.error || `Status check failed (${statusRes.status})`));
+              }
+              const status = await statusRes.json();
+              updateTrayCard(cardId, status.progress || 0, status.stage || 'Working…', '');
+              if (status.state === 'done') return resolve(status);
+              if (status.state === 'error') return reject(new Error(status.error || 'Download failed on server'));
+              setTimeout(poll, 1500);
+            } catch (err) {
+              reject(err);
+            }
+          };
+          poll();
+        });
 
-        if (!res.ok) {
-          const errData = await res.json().catch(() => ({}));
-          throw new Error(errData.error || `Server error ${res.status}`);
+        // Phase 3: stream the finished file to the writable
+        updateTrayCard(cardId, 100, 'Saving…', '');
+        const fileRes = await fetch(`${API_BASE}/api/download/file/${token}`);
+        if (!fileRes.ok) {
+          const errData = await fileRes.json().catch(() => ({}));
+          throw new Error(errData.error || `File fetch failed (${fileRes.status})`);
         }
 
-        const total = Number(res.headers.get('Content-Length') || 0);
-        const reader = res.body && res.body.getReader ? res.body.getReader() : null;
+        const total = Number(fileRes.headers.get('Content-Length') || 0);
+        const reader = fileRes.body && fileRes.body.getReader ? fileRes.body.getReader() : null;
         if (!reader) throw new Error('Streaming not supported in this browser.');
 
         let received = 0;
-        updateTrayCard(cardId, 88, 'Downloading…',
-          total > 0 ? `0 B / ${formatBytes(total)}` : '');
-
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -1453,11 +1480,10 @@
           received += value.byteLength || value.length || 0;
           if (total > 0) {
             const pct = Math.min(100, Math.round((received / total) * 100));
-            const uiPct = Math.min(99, Math.round(88 + (pct * 0.11)));
-            updateTrayCard(cardId, uiPct, `Downloading ${pct}%`,
+            updateTrayCard(cardId, pct, `Saving… ${pct}%`,
               `${formatBytes(received)} / ${formatBytes(total)}`);
           } else {
-            updateTrayCard(cardId, 94, 'Downloading…', formatBytes(received));
+            updateTrayCard(cardId, 99, 'Saving…', formatBytes(received));
           }
         }
 
@@ -1465,7 +1491,6 @@
         finishTrayCard(cardId, true, suggestedFilename);
         showToast(`Done: ${videoTitle.slice(0, 40)}`);
       } catch (err) {
-        if (prepTicker) { clearInterval(prepTicker); prepTicker = null; }
         if (writable) { try { await writable.abort(); } catch (_) { } }
         finishTrayCard(cardId, false, (err.message || 'Unknown error').slice(0, 60));
         showToast('Download failed: ' + (err.message || 'Unknown error').slice(0, 60), 'error');

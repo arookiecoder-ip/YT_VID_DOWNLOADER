@@ -680,6 +680,206 @@ app.get("/api/download-meta", async (req, res) => {
   });
 });
 
+// ── Job store ────────────────────────────────────────────────────────────────
+// Keyed by token (random hex). States: pending → done | error.
+// Files are cleaned up after JOB_TTL_MS or on first file request.
+const JOB_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const jobs = new Map();
+
+function createJob(token, meta) {
+  jobs.set(token, {
+    token,
+    state: "pending",   // pending | done | error
+    progress: 0,        // 0-100
+    stage: "Queued",
+    filename: null,
+    filePath: null,
+    contentType: null,
+    fileSize: null,
+    error: null,
+    createdAt: Date.now(),
+    ...meta,
+  });
+}
+
+function updateJob(token, patch) {
+  const job = jobs.get(token);
+  if (job) jobs.set(token, { ...job, ...patch });
+}
+
+function cleanupJob(token) {
+  const job = jobs.get(token);
+  if (!job) return;
+  removeFileQuietly(job.filePath);
+  jobs.delete(token);
+}
+
+// Sweep expired jobs every 10 minutes.
+setInterval(() => {
+  const now = Date.now();
+  for (const [token, job] of jobs.entries()) {
+    if (now - job.createdAt > JOB_TTL_MS) cleanupJob(token);
+  }
+}, 10 * 60 * 1000);
+
+async function runDownloadJob(token, url, formatId, isAudio) {
+  const outputExt = isAudio ? "mp3" : "mp4";
+  let tempPath = null;
+
+  try {
+    updateJob(token, { stage: "Downloading…", progress: 5 });
+
+    tempPath = createTempDownloadPath(outputExt);
+    const ytdlpArgs = withCookies(buildDownloadArgs(formatId, isAudio, tempPath));
+    ytdlpArgs.push(url);
+
+    const [titleRaw] = await Promise.all([
+      runYtDlp(["--get-title", "--no-warnings", "--no-playlist", url]).catch(() => "video"),
+      new Promise((resolve, reject) => {
+        const proc = spawn(YT_DLP, ytdlpArgs, { stdio: ["ignore", "pipe", "pipe"] });
+        let stderr = "";
+        let lastProgress = 5;
+
+        proc.stderr.on("data", (chunk) => {
+          const text = chunk.toString();
+          stderr += text;
+          // Parse yt-dlp progress lines like "[download]  42.3% of ..."
+          const m = text.match(/(\d+(?:\.\d+)?)%/);
+          if (m) {
+            const pct = Math.min(80, Math.round(5 + (parseFloat(m[1]) / 100) * 70));
+            if (pct > lastProgress) {
+              lastProgress = pct;
+              updateJob(token, { progress: pct });
+            }
+          }
+          const line = text.trim();
+          if (line) console.error("[job:" + token.slice(0, 6) + "]", line);
+        });
+        proc.on("close", (code) => {
+          if (code === 0) { resolve(); return; }
+          removeFileQuietly(tempPath);
+          reject(new Error(stderr.trim().slice(-300) || "yt-dlp exited with code " + code));
+        });
+        proc.on("error", (err) => { removeFileQuietly(tempPath); reject(err); });
+      }),
+    ]);
+
+    if (!fs.existsSync(tempPath)) throw new Error("Downloaded file was not generated.");
+
+    if (!isAudio) {
+      updateJob(token, { stage: "Processing…", progress: 83 });
+      const remuxedPath = createTempDownloadPath("mp4");
+      await new Promise((resolve, reject) => {
+        const proc = spawn("ffmpeg", [
+          "-i", tempPath, "-c", "copy", "-movflags", "+faststart", "-y", remuxedPath,
+        ], { stdio: ["ignore", "pipe", "pipe"] });
+        let stderr = "";
+        proc.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+        proc.on("close", (code) => {
+          removeFileQuietly(tempPath);
+          tempPath = null;
+          if (code === 0) { resolve(); return; }
+          removeFileQuietly(remuxedPath);
+          reject(new Error("ffmpeg remux failed: " + stderr.slice(-300)));
+        });
+        proc.on("error", reject);
+      });
+      tempPath = remuxedPath;
+    }
+
+    if (!fs.existsSync(tempPath)) throw new Error("Output file was not generated.");
+
+    const safeTitle = sanitizeFilename(titleRaw);
+    const filename = safeTitle + "." + outputExt;
+    const stat = fs.statSync(tempPath);
+
+    updateJob(token, {
+      state: "done",
+      progress: 100,
+      stage: "Ready",
+      filename,
+      filePath: tempPath,
+      contentType: isAudio ? "audio/mpeg" : "video/mp4",
+      fileSize: stat.size,
+    });
+    console.log("[job:" + token.slice(0, 6) + "] done →", filename);
+  } catch (err) {
+    console.error("[job:" + token.slice(0, 6) + "] error:", err.message);
+    removeFileQuietly(tempPath);
+    updateJob(token, { state: "error", stage: "Failed", error: err.message.slice(0, 300) });
+  }
+}
+
+// POST /api/download/start — kick off background job, return token immediately
+app.post("/api/download/start", downloadLimiter, (req, res) => {
+  const source = req.body || {};
+  const url = String(source.url || "").trim();
+  const formatId = String(source.formatId || "best").trim();
+  const ext = String(source.ext || "mp4").trim().toLowerCase();
+
+  if (!url || !isValidYouTubeURL(url)) {
+    return res.status(400).json({ error: "Invalid or missing YouTube URL" });
+  }
+
+  const isAudio = ext === "mp3" || formatId === "bestaudio";
+  const token = crypto.randomBytes(16).toString("hex");
+
+  createJob(token, { url, formatId, isAudio });
+  // Fire and forget — response returns before the download starts
+  runDownloadJob(token, url, formatId, isAudio);
+
+  res.json({ token });
+});
+
+// GET /api/download/status/:token — poll for job progress
+app.get("/api/download/status/:token", (req, res) => {
+  const token = String(req.params.token || "").trim();
+  const job = jobs.get(token);
+  if (!job) return res.status(404).json({ error: "Job not found or expired" });
+
+  res.json({
+    state: job.state,
+    progress: job.progress,
+    stage: job.stage,
+    filename: job.filename,
+    fileSize: job.fileSize,
+    error: job.error,
+  });
+});
+
+// GET /api/download/file/:token — stream the finished file, then clean up
+app.get("/api/download/file/:token", (req, res) => {
+  const token = String(req.params.token || "").trim();
+  const job = jobs.get(token);
+
+  if (!job) return res.status(404).json({ error: "Job not found or expired" });
+  if (job.state === "pending") return res.status(202).json({ error: "Download not ready yet" });
+  if (job.state === "error") return res.status(500).json({ error: job.error || "Download failed" });
+  if (!job.filePath || !fs.existsSync(job.filePath)) {
+    cleanupJob(token);
+    return res.status(410).json({ error: "File has already been served or was cleaned up" });
+  }
+
+  const encodedFilename = encodeURIComponent(job.filename);
+  res.set({
+    "Content-Type": job.contentType,
+    "Content-Disposition":
+      'attachment; filename="' + job.filename + "\"; filename*=UTF-8''" + encodedFilename,
+    "Cache-Control": "no-store",
+    "Content-Length": String(job.fileSize),
+  });
+
+  const fileStream = fs.createReadStream(job.filePath);
+  fileStream.on("error", (err) => {
+    cleanupJob(token);
+    if (!res.headersSent) res.status(500).json({ error: "File read failed: " + err.message });
+    else res.destroy(err);
+  });
+  fileStream.on("close", () => cleanupJob(token));
+  fileStream.pipe(res);
+});
+
+// Legacy direct-download (kept for iframe fallback path used by playlists)
 async function streamDownload(req, res) {
   const source =
     req.method === "GET" || req.method === "HEAD" ? req.query : req.body || {};
@@ -697,16 +897,12 @@ async function streamDownload(req, res) {
   let tempPath = null;
 
   try {
-    // Download to temp file and fetch title in parallel — title lookup
-    // runs concurrently so it doesn't add to the total wait time.
     tempPath = createTempDownloadPath(outputExt);
     const ytdlpArgs = withCookies(buildDownloadArgs(formatId, isAudio, tempPath));
     ytdlpArgs.push(url);
 
     const [titleRaw] = await Promise.all([
-      // Title fetch — allowed to fail silently
       runYtDlp(["--get-title", "--no-warnings", "--no-playlist", url]).catch(() => "video"),
-      // Actual download
       new Promise((resolve, reject) => {
         const proc = spawn(YT_DLP, ytdlpArgs, { stdio: ["ignore", "pipe", "pipe"] });
         let stderr = "";
@@ -715,7 +911,6 @@ async function streamDownload(req, res) {
           const line = chunk.toString().trim();
           if (line) console.error("[/api/download]", line);
         });
-        // Do NOT kill on req close — connection drops briefly during file picker
         proc.on("close", (code) => {
           if (code === 0) { resolve(); return; }
           removeFileQuietly(tempPath);
@@ -725,21 +920,13 @@ async function streamDownload(req, res) {
       }),
     ]);
 
-    if (!fs.existsSync(tempPath)) {
-      throw new Error("Downloaded file was not generated.");
-    }
+    if (!fs.existsSync(tempPath)) throw new Error("Downloaded file was not generated.");
 
-    // Remux to proper MP4 with faststart (stream copy, no re-encode)
-    // This fixes MPEG-TS container issues and ensures seekable playback.
     if (!isAudio) {
       const remuxedPath = createTempDownloadPath("mp4");
       await new Promise((resolve, reject) => {
         const proc = spawn("ffmpeg", [
-          "-i", tempPath,
-          "-c", "copy",
-          "-movflags", "+faststart",
-          "-y",
-          remuxedPath,
+          "-i", tempPath, "-c", "copy", "-movflags", "+faststart", "-y", remuxedPath,
         ], { stdio: ["ignore", "pipe", "pipe"] });
         let stderr = "";
         proc.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
@@ -754,9 +941,7 @@ async function streamDownload(req, res) {
       tempPath = remuxedPath;
     }
 
-    if (!fs.existsSync(tempPath)) {
-      throw new Error("Output file was not generated.");
-    }
+    if (!fs.existsSync(tempPath)) throw new Error("Output file was not generated.");
 
     const safeTitle = sanitizeFilename(titleRaw);
     const filename = safeTitle + "." + outputExt;
@@ -769,44 +954,29 @@ async function streamDownload(req, res) {
         'attachment; filename="' + filename + "\"; filename*=UTF-8''" + encodedFilename,
       "Cache-Control": "no-store",
       "Content-Length": String(stat.size),
-      "X-Download-Size-Bytes": String(stat.size),
-      "X-Download-Size-Exact": "1",
     });
 
     let cleaned = false;
-    const cleanup = () => {
-      if (cleaned) return;
-      cleaned = true;
-      removeFileQuietly(tempPath);
-    };
-
+    const cleanup = () => { if (cleaned) return; cleaned = true; removeFileQuietly(tempPath); };
     const fileStream = fs.createReadStream(tempPath);
     fileStream.on("error", (err) => {
       cleanup();
-      if (!res.headersSent) {
-        res.status(500).json({ error: "Download failed: " + err.message.slice(0, 200) });
-      } else {
-        res.destroy(err);
-      }
+      if (!res.headersSent) res.status(500).json({ error: "Download failed: " + err.message.slice(0, 200) });
+      else res.destroy(err);
     });
     fileStream.on("close", cleanup);
     res.on("close", cleanup);
     fileStream.pipe(res);
-
   } catch (err) {
     console.error("[/api/download]", err.message);
     removeFileQuietly(tempPath);
-    if (!res.headersSent) {
-      res.status(500).json({ error: "Download failed: " + err.message.slice(0, 200) });
-    }
+    if (!res.headersSent) res.status(500).json({ error: "Download failed: " + err.message.slice(0, 200) });
   }
 }
 
-// GET /api/download
+// GET /api/download — legacy direct stream (used by playlist iframe fallback)
 app.use("/api/download", downloadLimiter);
 app.get("/api/download", streamDownload);
-
-// Backward-compatible POST /api/download
 app.post("/api/download", streamDownload);
 
 // GET /api/formats

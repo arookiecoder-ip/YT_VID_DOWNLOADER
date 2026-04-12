@@ -845,66 +845,58 @@
 
         writable = await handle.createWritable();
 
-        // Large HD selections may take time before first byte arrives while backend merges tracks.
-        let prepPct = 30;
-        setProgressState(
-          progressBar,
-          progressPercent,
-          progressSize,
-          prepPct,
-          'Merging on server…',
-          'Step 3/4: Preparing video + audio tracks'
-        );
-        prepTicker = setInterval(() => {
-          prepPct = Math.min(prepPct + 2, 88);
-          setProgressState(
-            progressBar,
-            progressPercent,
-            progressSize,
-            prepPct,
-            'Merging on server…',
-            'Step 3/4: Preparing video + audio tracks'
-          );
-        }, 900);
+        // Phase 1: kick off background job — returns token immediately
+        setProgressState(progressBar, progressPercent, progressSize, 5, 'Starting…', 'Step 3/4: Queuing download');
+        const startRes = await fetch(`${API_BASE}/api/download/start`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            url: params.get('url'),
+            formatId: params.get('formatId'),
+            ext: params.get('ext'),
+          }),
+        });
+        if (!startRes.ok) {
+          const err = await startRes.json().catch(() => ({}));
+          throw new Error(err.error || 'Failed to start download');
+        }
+        const { token } = await startRes.json();
 
-        const res = await fetch(`${API_BASE}/api/download?${params.toString()}`);
-        if (prepTicker) {
-          clearInterval(prepTicker);
-          prepTicker = null;
+        // Phase 2: poll until done
+        await new Promise((resolve, reject) => {
+          const poll = async () => {
+            try {
+              const statusRes = await fetch(`${API_BASE}/api/download/status/${token}`);
+              if (!statusRes.ok) {
+                const e = await statusRes.json().catch(() => ({}));
+                return reject(new Error(e.error || `Status check failed (${statusRes.status})`));
+              }
+              const status = await statusRes.json();
+              setProgressState(progressBar, progressPercent, progressSize,
+                status.progress || 0, status.stage || 'Working…', 'Step 3/4: Processing on server');
+              if (status.state === 'done') return resolve();
+              if (status.state === 'error') return reject(new Error(status.error || 'Download failed on server'));
+              setTimeout(poll, 1500);
+            } catch (err) { reject(err); }
+          };
+          poll();
+        });
+
+        // Phase 3: stream the finished file
+        setProgressState(progressBar, progressPercent, progressSize, 90, 'Downloading…', 'Step 4/4: Transferring file');
+        const fileRes = await fetch(`${API_BASE}/api/download/file/${token}`);
+        if (!fileRes.ok) {
+          const err = await fileRes.json().catch(() => ({}));
+          throw new Error(err.error || 'File fetch failed');
         }
 
-        if (!res.ok) {
-          const err = await res.json().catch(() => ({}));
-          throw new Error(err.error || 'Download failed');
-        }
-
-        const total = Number(res.headers.get('Content-Length') || 0);
-        const reader = res.body && res.body.getReader ? res.body.getReader() : null;
+        const total = Number(fileRes.headers.get('Content-Length') || 0);
+        const reader = fileRes.body && fileRes.body.getReader ? fileRes.body.getReader() : null;
         if (!reader) {
           throw new Error('Streaming is not supported in this browser.');
         }
 
         let received = 0;
-        if (total > 0) {
-          setProgressState(
-            progressBar,
-            progressPercent,
-            progressSize,
-            90,
-            'Downloading…',
-            `Step 4/4: 0 B / ${formatBytes(total)}`
-          );
-        } else {
-          setProgressState(
-            progressBar,
-            progressPercent,
-            progressSize,
-            90,
-            'Downloading…',
-            'Step 4/4: Total size unavailable'
-          );
-        }
-
         while (true) {
           const { done, value } = await reader.read();
           if (done) break;
@@ -915,34 +907,15 @@
           if (total > 0) {
             const pct = Math.min(100, Math.round((received / total) * 100));
             const uiPct = Math.min(100, Math.round(90 + (pct * 0.1)));
-            setProgressState(
-              progressBar,
-              progressPercent,
-              progressSize,
-              uiPct,
-              `Downloading… ${pct}%`,
-              `Step 4/4: ${formatBytes(received)} / ${formatBytes(total)}`
-            );
+            setProgressState(progressBar, progressPercent, progressSize,
+              uiPct, `Downloading… ${pct}%`, `Step 4/4: ${formatBytes(received)} / ${formatBytes(total)}`);
           } else {
-            setProgressState(
-              progressBar,
-              progressPercent,
-              progressSize,
-              95,
-              'Downloading…',
-              `Step 4/4: Received ${formatBytes(received)}`
-            );
+            setProgressState(progressBar, progressPercent, progressSize,
+              95, 'Downloading…', `Step 4/4: Received ${formatBytes(received)}`);
           }
         }
 
-        setProgressState(
-          progressBar,
-          progressPercent,
-          progressSize,
-          100,
-          'Completed',
-          `Saved to: ${suggestedFilename}`
-        );
+        setProgressState(progressBar, progressPercent, progressSize, 100, 'Completed', `Saved to: ${suggestedFilename}`);
         await writable.close();
         return { supported: true, completed: true, cancelled: false };
       } catch (err) {

@@ -769,6 +769,14 @@
     let currentVideo = null;
     let selectedFormat = null;
     let downloadFrameCounter = 0;
+    let activeDownloads = 0;
+
+    window.addEventListener('beforeunload', e => {
+      if (activeDownloads > 0) {
+        e.preventDefault();
+        e.returnValue = '';
+      }
+    });
 
     function isValidYouTubeURL(url) {
       return [
@@ -1139,61 +1147,22 @@
         ext,
       });
 
-      btn.disabled = true;
-      btn.querySelector('span').textContent = 'Preparing…';
+      // Use size already known from /api/info — no extra network call needed
+      const knownBytes = selectedFmt.filesize || selectedFmt.filesizeApprox || null;
+      const sizeExact = selectedFmt.sizeExact || false;
+      const sizeLabel = knownBytes
+        ? `${sizeExact ? 'Exact' : 'Estimated'}: ${formatBytes(knownBytes)}`
+        : 'Size unavailable';
+
       progressWrap.classList.add('active');
-      setProgressState(
-        progressBar,
-        progressPercent,
-        progressSize,
-        10,
-        'Checking size…',
-        'Step 1/4: Getting estimated download size'
-      );
-
-      let sizeMeta = null;
-      try {
-        const metaRes = await fetch(`${API_BASE}/api/download-meta?${params.toString()}`);
-        const metaData = await metaRes.json().catch(() => ({}));
-        if (metaRes.ok) {
-          sizeMeta = metaData;
-        }
-      } catch (_) {
-        sizeMeta = null;
-      }
-
-      if (sizeMeta && sizeMeta.sizeBytes) {
-        setProgressState(
-          progressBar,
-          progressPercent,
-          progressSize,
-          20,
-          sizeMeta.sizeExact ? 'Exact size found' : 'Estimated size found',
-          `Step 2/4: ${formatBytes(sizeMeta.sizeBytes)}`
-        );
-      } else {
-        setProgressState(
-          progressBar,
-          progressPercent,
-          progressSize,
-          20,
-          'Size unknown',
-          'Step 2/4: Will update while downloading'
-        );
-      }
+      setProgressState(progressBar, progressPercent, progressSize, 20, 'Ready', sizeLabel);
 
       const suggestedFilename = `${sanitizeClientFilename(currentVideo.title || 'video')}.${ext}`;
       btn.querySelector('span').textContent = 'Choose folder…';
-      setProgressState(
-        progressBar,
-        progressPercent,
-        progressSize,
-        25,
-        'Waiting for folder selection',
-        'Step 2/4: Choose where to save the file'
-      );
+      setProgressState(progressBar, progressPercent, progressSize, 25, 'Waiting for folder…', 'Choose where to save the file');
       showToast('Pick your file location. Download starts after server prep.');
 
+      activeDownloads++;
       const pickerResult = await tryDownloadWithFilePicker(
         params,
         suggestedFilename,
@@ -1202,41 +1171,29 @@
         progressPercent,
         progressSize
       );
+      activeDownloads = Math.max(0, activeDownloads - 1);
+
+      btn.querySelector('span').textContent = getDefaultDownloadButtonLabel();
 
       if (pickerResult.cancelled) {
         showToast('Download cancelled', 'error');
-        btn.disabled = false;
-        btn.querySelector('span').textContent = getDefaultDownloadButtonLabel();
         return;
       }
 
       if (pickerResult.completed) {
         showToast('Download complete!');
-        btn.disabled = false;
-        btn.querySelector('span').textContent = getDefaultDownloadButtonLabel();
         return;
       }
 
+      // Fallback: browser-native download via hidden iframe (no progress, but non-blocking)
+      activeDownloads++;
       queueIframeDownload(params);
-      btn.querySelector('span').textContent = 'Starting…';
-      setProgressState(
-        progressBar,
-        progressPercent,
-        progressSize,
-        100,
-        'Started in browser',
-        'Live bytes unavailable in fallback mode'
+      setProgressState(progressBar, progressPercent, progressSize, 100, 'Started in browser', 'Downloading in background — you can start another');
+      showToast(knownBytes
+        ? `Download started (${sizeLabel}). You can start another now.`
+        : 'Download started. You can start another now.'
       );
-      setTimeout(() => {
-        btn.disabled = false;
-        btn.querySelector('span').textContent = getDefaultDownloadButtonLabel();
-      }, 800);
-
-      if (sizeMeta && sizeMeta.sizeBytes) {
-        showToast(`Download started (${sizeMeta.sizeExact ? 'exact' : 'estimated'}: ${formatBytes(sizeMeta.sizeBytes)}). You can queue more now.`);
-      } else {
-        showToast('Download started. You can queue more now.');
-      }
+      setTimeout(() => { activeDownloads = Math.max(0, activeDownloads - 1); }, 120000);
     }
   </script>
 </body>

@@ -685,66 +685,54 @@ async function streamDownload(req, res) {
     req.method === "GET" || req.method === "HEAD" ? req.query : req.body || {};
   const url = String(source.url || "").trim();
   const formatId = String(source.formatId || "best").trim();
-  const ext = String(source.ext || "mp4")
-    .trim()
-    .toLowerCase();
+  const ext = String(source.ext || "mp4").trim().toLowerCase();
 
   if (!url || !isValidYouTubeURL(url)) {
     return res.status(400).json({ error: "Invalid or missing YouTube URL" });
   }
 
   const isAudio = ext === "mp3" || formatId === "bestaudio";
-  const selector = getFormatSelector(formatId, isAudio);
-  const needsTempMergedFile = !isAudio && selector.includes("+");
   const outputExt = isAudio ? "mp3" : "mp4";
-  const contentType = "video/mp4";
+  const contentType = isAudio ? "audio/mpeg" : "video/mp4";
   let tempPath = null;
 
   try {
-    const titleRaw = await runYtDlp(["--get-title", "--no-warnings", "--no-playlist", url]);
-    const safeTitle = sanitizeFilename(titleRaw);
-    const filename = safeTitle + "." + outputExt;
-    const encodedFilename = encodeURIComponent(filename);
+    // Download to temp file and fetch title in parallel — title lookup
+    // runs concurrently so it doesn't add to the total wait time.
+    tempPath = createTempDownloadPath(outputExt);
+    const ytdlpArgs = withCookies(buildDownloadArgs(formatId, isAudio, tempPath));
+    ytdlpArgs.push(url);
 
-    if (needsTempMergedFile) {
-      tempPath = createTempDownloadPath(outputExt);
-      const ytdlpArgs = withCookies(buildDownloadArgs(formatId, isAudio, tempPath));
-      ytdlpArgs.push(url);
-
-      await new Promise((resolve, reject) => {
+    const [titleRaw] = await Promise.all([
+      // Title fetch — allowed to fail silently
+      runYtDlp(["--get-title", "--no-warnings", "--no-playlist", url]).catch(() => "video"),
+      // Actual download
+      new Promise((resolve, reject) => {
         const proc = spawn(YT_DLP, ytdlpArgs, { stdio: ["ignore", "pipe", "pipe"] });
         let stderr = "";
-
         proc.stderr.on("data", (chunk) => {
           stderr += chunk.toString();
           const line = chunk.toString().trim();
           if (line) console.error("[/api/download]", line);
         });
-
-        // Do NOT kill yt-dlp on req close during merge — the client connection
-        // may drop briefly while the file picker is open. We must let the merge
-        // finish before we can stream the result.
-
+        // Do NOT kill on req close — connection drops briefly during file picker
         proc.on("close", (code) => {
-          if (code === 0) {
-            resolve();
-            return;
-          }
-
-          const msg =
-            stderr.trim().slice(-300) || "yt-dlp exited with code " + code;
-          reject(new Error(msg));
+          if (code === 0) { resolve(); return; }
+          removeFileQuietly(tempPath);
+          reject(new Error(stderr.trim().slice(-300) || "yt-dlp exited with code " + code));
         });
+        proc.on("error", (err) => { removeFileQuietly(tempPath); reject(err); });
+      }),
+    ]);
 
-        proc.on("error", reject);
-      });
+    if (!fs.existsSync(tempPath)) {
+      throw new Error("Downloaded file was not generated.");
+    }
 
-      if (!fs.existsSync(tempPath)) {
-        throw new Error("Merged output was not generated.");
-      }
-
-      // Remux to MP4 with faststart using stream copy (no re-encode — fast, no quality loss)
-      const remuxedPath = createTempDownloadPath(outputExt);
+    // Remux to proper MP4 with faststart (stream copy, no re-encode)
+    // This fixes MPEG-TS container issues and ensures seekable playback.
+    if (!isAudio) {
+      const remuxedPath = createTempDownloadPath("mp4");
       await new Promise((resolve, reject) => {
         const proc = spawn("ffmpeg", [
           "-i", tempPath,
@@ -764,164 +752,52 @@ async function streamDownload(req, res) {
         proc.on("error", reject);
       });
       tempPath = remuxedPath;
-
-      if (!fs.existsSync(tempPath)) {
-        throw new Error("Re-encoded output was not generated.");
-      }
-
-      const stat = fs.statSync(tempPath);
-      res.set({
-        "Content-Type": contentType,
-        "Content-Disposition":
-          'attachment; filename="' +
-          filename +
-          "\"; filename*=UTF-8''" +
-          encodedFilename,
-        "Cache-Control": "no-store",
-        "X-Download-Size-Bytes": String(stat.size),
-        "X-Download-Size-Exact": "1",
-        "Content-Length": String(stat.size),
-      });
-
-      let cleaned = false;
-      const cleanup = () => {
-        if (cleaned) return;
-        cleaned = true;
-        removeFileQuietly(tempPath);
-      };
-
-      const fileStream = fs.createReadStream(tempPath);
-      fileStream.on("error", (err) => {
-        cleanup();
-        if (!res.headersSent) {
-          res
-            .status(500)
-            .json({ error: "Download failed: " + err.message.slice(0, 200) });
-        } else {
-          res.destroy(err);
-        }
-      });
-
-      fileStream.on("close", cleanup);
-      res.on("close", cleanup);
-      fileStream.pipe(res);
-      return;
     }
 
-    // For single-stream video (non-merged) and audio: pipe yt-dlp → ffmpeg → response
-    // directly without buffering to disk. This sends the first bytes immediately,
-    // preventing Cloudflare's 100s proxy read timeout (524 error).
-    // For video: ffmpeg rewraps the raw TS stream into an MP4-compatible output.
-    // For audio: pass through directly (yt-dlp already extracts mp3).
+    if (!fs.existsSync(tempPath)) {
+      throw new Error("Output file was not generated.");
+    }
 
-    const sizeMeta = await probeDownloadSize(url, formatId, isAudio);
+    const safeTitle = sanitizeFilename(titleRaw);
+    const filename = safeTitle + "." + outputExt;
+    const encodedFilename = encodeURIComponent(filename);
+    const stat = fs.statSync(tempPath);
 
     res.set({
-      "Content-Type": isAudio ? "audio/mpeg" : contentType,
+      "Content-Type": contentType,
       "Content-Disposition":
-        'attachment; filename="' +
-        filename +
-        "\"; filename*=UTF-8''" +
-        encodedFilename,
+        'attachment; filename="' + filename + "\"; filename*=UTF-8''" + encodedFilename,
       "Cache-Control": "no-store",
-      "X-Download-Size-Bytes": String(sizeMeta.bytes || ""),
-      "X-Download-Size-Exact": sizeMeta.exact ? "1" : "0",
+      "Content-Length": String(stat.size),
+      "X-Download-Size-Bytes": String(stat.size),
+      "X-Download-Size-Exact": "1",
     });
 
-    if (isAudio) {
-      // Audio: pipe yt-dlp stdout directly to response
-      const args = withCookies(buildDownloadArgs(formatId, isAudio, "-"));
-      args.push(url);
-      const proc = spawn(YT_DLP, args, { stdio: ["ignore", "pipe", "pipe"] });
-      let stderr = "";
-      proc.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-      proc.on("error", (err) => {
-        if (!res.headersSent) res.status(500).json({ error: err.message.slice(0, 200) });
-        else res.destroy(err);
-      });
-      proc.on("close", (code) => {
-        if (code !== 0) {
-          const msg = stderr.trim().slice(-300) || "yt-dlp exited with code " + code;
-          console.error("[/api/download]", msg);
-          if (!res.headersSent) res.status(500).json({ error: msg });
-        }
-        if (!res.writableEnded) res.end();
-      });
-      proc.stdout.pipe(res);
-      return;
-    }
+    let cleaned = false;
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      removeFileQuietly(tempPath);
+    };
 
-    // Video: pipe yt-dlp stdout → ffmpeg stdin → response
-    // ffmpeg reads the raw TS from stdin and muxes it to MP4 on stdout.
-    // -movflags frag_keyframe+empty_moov makes MP4 streamable without seeking to write moov.
-    const ytArgs = withCookies([
-      "--no-warnings", "--no-playlist", "--no-check-certificates", "--newline",
-      "-f", getFormatSelector(formatId, false),
-      "-o", "-",
-      url,
-    ]);
-    const ytProc = spawn(YT_DLP, ytArgs, { stdio: ["ignore", "pipe", "pipe"] });
-    const ffProc = spawn("ffmpeg", [
-      "-i", "pipe:0",
-      "-c", "copy",
-      "-movflags", "frag_keyframe+empty_moov+default_base_moof",
-      "-f", "mp4",
-      "pipe:1",
-    ], { stdio: ["pipe", "pipe", "pipe"] });
-
-    let ytStderr = "";
-    let ffStderr = "";
-
-    ytProc.stderr.on("data", (chunk) => { ytStderr += chunk.toString(); });
-    ffProc.stderr.on("data", (chunk) => { ffStderr += chunk.toString(); });
-
-    ytProc.stdout.pipe(ffProc.stdin);
-
-    ytProc.on("error", (err) => {
-      console.error("[/api/download] yt-dlp error:", err.message);
-      ffProc.kill();
-      if (!res.headersSent) res.status(500).json({ error: err.message.slice(0, 200) });
-      else res.destroy(err);
-    });
-
-    ytProc.on("close", (code) => {
-      if (code !== 0 && code !== null) {
-        const msg = ytStderr.trim().slice(-300) || "yt-dlp exited with code " + code;
-        console.error("[/api/download] yt-dlp:", msg);
+    const fileStream = fs.createReadStream(tempPath);
+    fileStream.on("error", (err) => {
+      cleanup();
+      if (!res.headersSent) {
+        res.status(500).json({ error: "Download failed: " + err.message.slice(0, 200) });
+      } else {
+        res.destroy(err);
       }
-      // Close ffmpeg stdin so it knows input is done
-      if (!ffProc.stdin.destroyed) ffProc.stdin.end();
     });
-
-    ffProc.on("error", (err) => {
-      console.error("[/api/download] ffmpeg error:", err.message);
-      if (!res.headersSent) res.status(500).json({ error: err.message.slice(0, 200) });
-      else res.destroy(err);
-    });
-
-    ffProc.on("close", (code) => {
-      if (code !== 0) {
-        const msg = ffStderr.trim().slice(-300) || "ffmpeg exited with code " + code;
-        console.error("[/api/download] ffmpeg:", msg);
-        if (!res.headersSent) res.status(500).json({ error: "Remux failed: " + msg });
-      }
-      if (!res.writableEnded) res.end();
-    });
-
-    // If client disconnects, kill both processes
-    res.on("close", () => {
-      if (!ytProc.killed) ytProc.kill("SIGTERM");
-      if (!ffProc.killed) ffProc.kill("SIGTERM");
-    });
-
-    ffProc.stdout.pipe(res);
+    fileStream.on("close", cleanup);
+    res.on("close", cleanup);
+    fileStream.pipe(res);
 
   } catch (err) {
     console.error("[/api/download]", err.message);
+    removeFileQuietly(tempPath);
     if (!res.headersSent) {
-      res
-        .status(500)
-        .json({ error: "Download failed: " + err.message.slice(0, 200) });
+      res.status(500).json({ error: "Download failed: " + err.message.slice(0, 200) });
     }
   }
 }

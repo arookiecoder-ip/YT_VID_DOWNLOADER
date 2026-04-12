@@ -709,11 +709,13 @@ async function streamDownload(req, res) {
 
         proc.stderr.on("data", (chunk) => {
           stderr += chunk.toString();
+          const line = chunk.toString().trim();
+          if (line) console.error("[/api/download]", line);
         });
 
-        req.on("close", () => {
-          if (!proc.killed) proc.kill("SIGTERM");
-        });
+        // Do NOT kill yt-dlp on req close during merge — the client connection
+        // may drop briefly while the file picker is open. We must let the merge
+        // finish before we can stream the result.
 
         proc.on("close", (code) => {
           if (code === 0) {

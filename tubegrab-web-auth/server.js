@@ -212,10 +212,11 @@ function isPlaylistURL(url) {
 }
 
 function withCookies(args) {
+  const base = ["--js-runtimes", "node", ...args];
   if (YTDLP_COOKIES && fs.existsSync(YTDLP_COOKIES)) {
-    return ["--cookies", YTDLP_COOKIES, ...args];
+    return ["--cookies", YTDLP_COOKIES, ...base];
   }
-  return args;
+  return base;
 }
 
 function runYtDlp(args) {

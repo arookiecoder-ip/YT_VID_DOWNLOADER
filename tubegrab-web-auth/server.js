@@ -701,11 +701,7 @@ async function streamDownload(req, res) {
   let tempPath = null;
 
   try {
-    // Fetch title and size in parallel to reduce startup delay
-    const [titleRaw, sizeMeta] = await Promise.all([
-      runYtDlp(["--get-title", "--no-warnings", "--no-playlist", url]),
-      probeDownloadSize(url, formatId, isAudio),
-    ]);
+    const titleRaw = await runYtDlp(["--get-title", "--no-warnings", "--no-playlist", url]);
     const safeTitle = sanitizeFilename(titleRaw);
     const filename = safeTitle + "." + outputExt;
     const encodedFilename = encodeURIComponent(filename);
@@ -812,9 +808,71 @@ async function streamDownload(req, res) {
       return;
     }
 
-    const args = withCookies(buildDownloadArgs(formatId, isAudio, "-"));
+    // Download to temp file first, then remux to proper MP4 container.
+    // Piping yt-dlp stdout directly produces MPEG-TS which Windows Media Player
+    // can't play and VLC seeks badly on. Remuxing to MP4 fixes both.
+    const rawTempPath = createTempDownloadPath(isAudio ? "mp3" : "ts");
+    const args = withCookies(buildDownloadArgs(formatId, isAudio, rawTempPath));
     args.push(url);
 
+    await new Promise((resolve, reject) => {
+      const proc = spawn(YT_DLP, args, { stdio: ["ignore", "pipe", "pipe"] });
+      let stderr = "";
+
+      proc.stderr.on("data", (chunk) => {
+        stderr += chunk.toString();
+        const line = chunk.toString().trim();
+        if (line) console.error("[/api/download]", line);
+      });
+
+      req.on("close", () => {
+        if (!proc.killed) proc.kill("SIGTERM");
+      });
+
+      proc.on("close", (code) => {
+        if (code === 0) { resolve(); return; }
+        removeFileQuietly(rawTempPath);
+        const msg = stderr.trim().slice(-300) || "yt-dlp exited with code " + code;
+        reject(new Error(msg));
+      });
+
+      proc.on("error", (err) => {
+        removeFileQuietly(rawTempPath);
+        reject(err);
+      });
+    });
+
+    let finalPath = rawTempPath;
+
+    if (!isAudio) {
+      // Remux TS → MP4 with faststart index for proper seeking and compatibility
+      const remuxedPath = createTempDownloadPath("mp4");
+      await new Promise((resolve, reject) => {
+        const proc = spawn("ffmpeg", [
+          "-i", rawTempPath,
+          "-c", "copy",
+          "-movflags", "+faststart",
+          "-y",
+          remuxedPath,
+        ], { stdio: ["ignore", "pipe", "pipe"] });
+        let stderr = "";
+        proc.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
+        proc.on("close", (code) => {
+          removeFileQuietly(rawTempPath);
+          if (code === 0) { resolve(); return; }
+          removeFileQuietly(remuxedPath);
+          reject(new Error("ffmpeg remux failed: " + stderr.slice(-300)));
+        });
+        proc.on("error", reject);
+      });
+      finalPath = remuxedPath;
+    }
+
+    if (!fs.existsSync(finalPath)) {
+      throw new Error("Output file was not generated.");
+    }
+
+    const stat = fs.statSync(finalPath);
     res.set({
       "Content-Type": isAudio ? "audio/mpeg" : contentType,
       "Content-Disposition":
@@ -823,55 +881,31 @@ async function streamDownload(req, res) {
         "\"; filename*=UTF-8''" +
         encodedFilename,
       "Cache-Control": "no-store",
-      "X-Download-Size-Bytes": String(sizeMeta.bytes || ""),
-      "X-Download-Size-Exact": sizeMeta.exact ? "1" : "0",
+      "X-Download-Size-Bytes": String(stat.size),
+      "X-Download-Size-Exact": "1",
+      "Content-Length": String(stat.size),
     });
 
-    if (sizeMeta.exact && sizeMeta.bytes && !isAudio) {
-      res.set("Content-Length", String(sizeMeta.bytes));
-    }
+    let cleaned = false;
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      removeFileQuietly(finalPath);
+    };
 
-    const proc = spawn(YT_DLP, args, { stdio: ["ignore", "pipe", "pipe"] });
-    let stderr = "";
-
-    proc.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-    });
-
-    proc.on("error", (err) => {
-      console.error("[/api/download] spawn error:", err.message);
+    const fileStream = fs.createReadStream(finalPath);
+    fileStream.on("error", (err) => {
+      cleanup();
       if (!res.headersSent) {
-        res
-          .status(500)
-          .json({ error: "Download failed: " + err.message.slice(0, 200) });
+        res.status(500).json({ error: "Download failed: " + err.message.slice(0, 200) });
       } else {
         res.destroy(err);
       }
     });
 
-    req.on("close", () => {
-      if (!proc.killed) {
-        proc.kill("SIGTERM");
-      }
-    });
-
-    proc.on("close", (code) => {
-      if (code !== 0) {
-        const msg =
-          stderr.trim().slice(-300) || "yt-dlp exited with code " + code;
-        console.error("[/api/download]", msg);
-        if (!res.headersSent) {
-          res.status(500).json({ error: "Download failed: " + msg });
-          return;
-        }
-      }
-
-      if (!res.writableEnded) {
-        res.end();
-      }
-    });
-
-    proc.stdout.pipe(res);
+    fileStream.on("close", cleanup);
+    res.on("close", cleanup);
+    fileStream.pipe(res);
   } catch (err) {
     console.error("[/api/download]", err.message);
     if (!res.headersSent) {

@@ -840,6 +840,16 @@
         justify-content: center;
       }
 
+      .loader-wrap {
+        margin-top: 24px;
+        gap: 12px;
+      }
+
+      .loader {
+        width: 36px;
+        height: 36px;
+      }
+
       .format-grid {
         grid-template-columns: repeat(2, 1fr);
       }
@@ -1344,7 +1354,10 @@
       setTimeout(() => t.classList.remove('show'), 3500);
     }
 
-    function showLoader(s) { document.getElementById('loader').classList.toggle('active', s); }
+    function showLoader(s) {
+      document.getElementById('loader').classList.toggle('active', s);
+      if (s) document.getElementById('featuresGrid').style.display = 'none';
+    }
     function showError(m) { const e = document.getElementById('errorMsg'); e.textContent = m; e.classList.toggle('active', !!m); }
     function showResult(s) {
       document.getElementById('resultCard').classList.toggle('active', s);

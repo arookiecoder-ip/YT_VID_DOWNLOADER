@@ -18,7 +18,20 @@ function parsePositiveEnvInt(value, fallback) {
 
 const NODE_ENV = process.env.NODE_ENV || "development";
 const PORT = process.env.PORT || 3000;
-const YT_DLP = process.env.YT_DLP_PATH || "yt-dlp";
+// Resolve the absolute path to yt-dlp at startup.
+// Using a bare name like "yt-dlp" with spawn() can fail in Docker because
+// child processes may not inherit the same PATH as the parent. We resolve
+// once via `which` (or `where` on Windows) and use the full path everywhere.
+const YT_DLP = (() => {
+  if (process.env.YT_DLP_PATH) return process.env.YT_DLP_PATH;
+  try {
+    const { execFileSync } = require("child_process");
+    const whichCmd = process.platform === "win32" ? "where" : "which";
+    return execFileSync(whichCmd, ["yt-dlp"], { encoding: "utf8" }).trim().split(/\r?\n/)[0];
+  } catch {
+    return "yt-dlp"; // fallback — will fail loudly at first use
+  }
+})();
 const YTDLP_COOKIES = process.env.YTDLP_COOKIES || "";
 const AUTH_USERNAME = process.env.AUTH_USERNAME || "admin";
 const AUTH_PASSWORD = process.env.AUTH_PASSWORD || "change-me-now";

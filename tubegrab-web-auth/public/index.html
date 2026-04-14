@@ -1441,6 +1441,7 @@
 
         // Phase 2: poll status until done or error
         await new Promise((resolve, reject) => {
+          const startedAt = Date.now();
           const poll = async () => {
             try {
               const statusRes = await fetch(`${API_BASE}/api/download/status/${token}`);
@@ -1449,10 +1450,14 @@
                 return reject(new Error(e.error || `Status check failed (${statusRes.status})`));
               }
               const status = await statusRes.json();
-              updateTrayCard(cardId, status.progress || 0, status.stage || 'Working…', '');
+              const elapsed = Math.round((Date.now() - startedAt) / 1000);
+              const elapsedStr = elapsed >= 60
+                ? `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`
+                : `${elapsed}s`;
+              updateTrayCard(cardId, status.progress || 0, status.stage || 'Working…', elapsedStr);
               if (status.state === 'done') return resolve(status);
               if (status.state === 'error') return reject(new Error(status.error || 'Download failed on server'));
-              setTimeout(poll, 1500);
+              setTimeout(poll, 3000);
             } catch (err) {
               reject(err);
             }

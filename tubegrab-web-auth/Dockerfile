@@ -8,8 +8,7 @@ RUN apt-get update && \
 # challenge solver scripts needed to bypass YouTube's n-challenge on headless servers.
 # Remove any pre-existing yt-dlp binary so only the pip-installed version is used.
 RUN pip3 install --break-system-packages -U "yt-dlp[default]" && \
-    rm -f /usr/local/bin/yt-dlp && \
-    ln -sf "$(python3 -c 'import sysconfig; print(sysconfig.get_path(\"scripts\"))')/yt-dlp" /usr/local/bin/yt-dlp
+    yt-dlp --version
 
 WORKDIR /app
 COPY package*.json ./

@@ -336,9 +336,27 @@ function normalizeRequestUrl(raw) {
   return normalized;
 }
 
+// If the configured cookie file is read-only (e.g. a Docker bind-mount with :ro),
+// yt-dlp will fail when it tries to update the file after use.
+// To avoid this, we copy the cookie file to a writable temp path once at startup
+// and point yt-dlp at the copy.
+let RESOLVED_COOKIES = "";
+if (YTDLP_COOKIES && fs.existsSync(YTDLP_COOKIES)) {
+  try {
+    const tmpCookies = path.join(os.tmpdir(), "tubegrab_cookies.txt");
+    fs.copyFileSync(YTDLP_COOKIES, tmpCookies);
+    fs.chmodSync(tmpCookies, 0o600);
+    RESOLVED_COOKIES = tmpCookies;
+    console.log("[cookies] Copied cookie file to writable temp path:", tmpCookies);
+  } catch (e) {
+    console.warn("[cookies] Could not copy cookie file, falling back to original path:", e.message);
+    RESOLVED_COOKIES = YTDLP_COOKIES;
+  }
+}
+
 function withCookies(args) {
-  if (YTDLP_COOKIES && fs.existsSync(YTDLP_COOKIES)) {
-    return ["--cookies", YTDLP_COOKIES, ...args];
+  if (RESOLVED_COOKIES && fs.existsSync(RESOLVED_COOKIES)) {
+    return ["--cookies", RESOLVED_COOKIES, ...args];
   }
   return args;
 }

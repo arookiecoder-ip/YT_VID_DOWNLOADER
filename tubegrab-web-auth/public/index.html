@@ -1435,99 +1435,56 @@
         return;
       }
 
-      if (entries.length > 25 && !window.confirm(`Queue downloads for ${entries.length} videos?`)) {
-        return;
-      }
-
-      const btn = document.getElementById('downloadBtn');
       const playlistTitle = currentVideo.title || 'Playlist';
-      const cardId = createTrayCard(playlistTitle, `${entries.length} videos`);
       const total = entries.length;
-      let started = 0;
-      let delivered = 0;
-      let failed = 0;
-      let finalized = false;
-
-      const maybeFinalize = () => {
-        if (finalized) return;
-        const settled = delivered + failed;
-        if (settled < total) return;
-        finalized = true;
-        if (failed > 0) {
-          finishTrayCard(cardId, false, `${delivered} completed • ${failed} failed`);
-          showToast(`Playlist done with errors (${delivered}/${total} completed).`, 'error');
-        } else {
-          finishTrayCard(cardId, true, `${delivered} completed`);
-          showToast(`Playlist complete: ${delivered} videos downloaded.`);
-        }
-      };
-
-      const updateSummary = (label) => {
-        const settled = delivered + failed;
-        const pct = total > 0 ? Math.round((settled / total) * 100) : 0;
-        updateTrayCard(
-          cardId,
-          pct,
-          label || `Processed ${settled} / ${total}`,
-          `${started} started • ${delivered} completed • ${failed} failed`
-        );
-        maybeFinalize();
-      };
+      const cardId = createTrayCard(playlistTitle, `${total} videos`);
+      const btn = document.getElementById('downloadBtn');
 
       btn.disabled = true;
-      btn.querySelector('span').textContent = 'Queueing…';
-      updateTrayCard(cardId, 0, 'Queueing…', `0 / ${entries.length}`);
+      btn.querySelector('span').textContent = 'Preparing ZIP…';
+      updateTrayCard(cardId, 0, 'Server is downloading videos…', `0 / ${total} — this may take a while`);
 
-      for (let i = 0; i < entries.length; i += 1) {
-        const item = entries[i];
-        try {
-          const { token } = await startDownloadJobWithRetry(
-            item.url,
-            formatId,
-            ext,
-            () => {
-              updateSummary('Waiting for available server slot…');
-            },
-          );
-          started += 1;
-          updateSummary(`Queued ${started} / ${total}`);
+      try {
+        const res = await fetch(`${API_BASE}/api/download/playlist-zip`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ url: currentVideo.url, formatId, ext }),
+        });
 
-          (async () => {
-            try {
-              await waitForDownloadReady(token);
-              activeDownloads += 1;
-              queueIframeFileDownload(token, () => {
-                activeDownloads = Math.max(0, activeDownloads - 1);
-                delivered += 1;
-                updateSummary();
-              });
-            } catch (err) {
-              failed += 1;
-              console.warn(`Playlist item failed (${item.url}):`, err);
-              updateSummary();
-            }
-          })();
-        } catch (err) {
-          failed += 1;
-          console.warn(`Failed to queue playlist item (${item.url}):`, err);
-          updateSummary();
+        if (!res.ok) {
+          const err = await res.json().catch(() => ({}));
+          throw new Error(err.error || `Server error ${res.status}`);
         }
 
-        if (i < entries.length - 1) {
-          await delay(180);
-        }
+        updateTrayCard(cardId, 50, 'Receiving ZIP…', 'Downloading archive from server');
+
+        const blob = await res.blob();
+
+        // Extract filename from Content-Disposition header if available
+        let filename = playlistTitle + '.zip';
+        const cd = res.headers.get('Content-Disposition') || '';
+        const fnMatch = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';\r\n]+)/i);
+        if (fnMatch) filename = decodeURIComponent(fnMatch[1].trim().replace(/^["']|["']$/g, ''));
+
+        // Trigger browser download
+        const objectUrl = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = objectUrl;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        setTimeout(() => { URL.revokeObjectURL(objectUrl); a.remove(); }, 1000);
+
+        finishTrayCard(cardId, true, `${total} videos packed into ZIP`);
+        showToast(`Playlist ZIP ready: ${filename}`);
+      } catch (err) {
+        console.error('Playlist ZIP failed:', err);
+        finishTrayCard(cardId, false, err.message || 'ZIP download failed');
+        showToast(err.message || 'Playlist ZIP failed', 'error');
+      } finally {
+        btn.disabled = false;
+        btn.querySelector('span').textContent = getDefaultDownloadButtonLabel();
       }
-
-      btn.disabled = false;
-      btn.querySelector('span').textContent = getDefaultDownloadButtonLabel();
-
-      if (started === 0) {
-        finishTrayCard(cardId, false, 'No items were queued');
-        showToast('Unable to queue playlist downloads.', 'error');
-        return;
-      }
-
-      updateSummary('Waiting for server jobs…');
     }
 
     function showToast(msg, type = 'success') {

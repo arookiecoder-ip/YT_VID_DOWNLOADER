@@ -7,6 +7,7 @@ const rateLimit = require("express-rate-limit");
 const path = require("path");
 const os = require("os");
 const fs = require("fs");
+const archiver = require("archiver");
 require("dotenv").config();
 
 const app = express();
@@ -1420,6 +1421,114 @@ async function streamDownload(req, res) {
         .json({ error: "Download failed: " + err.message.slice(0, 200) });
   }
 }
+
+// POST /api/download/playlist-zip — download all playlist videos and stream as a ZIP
+const playlistZipLimiter = rateLimit({
+  windowMs: 10 * 60 * 1000,
+  max: 3,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many playlist ZIP requests. Wait and retry." },
+});
+
+app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
+  const source = req.body || {};
+  const url = normalizeRequestUrl(source.url);
+  const formatId = String(source.formatId || "best").trim();
+  const ext = String(source.ext || "mp4").trim().toLowerCase();
+
+  if (!url || !isPlaylistURL(url)) {
+    return res.status(400).json({ error: "Invalid or missing playlist URL" });
+  }
+
+  const isAudio = ext === "mp3" || formatId === "bestaudio";
+
+  // Fetch playlist entries
+  let entries;
+  try {
+    const rawPlaylist = await runYtDlp([
+      "--dump-single-json",
+      "--flat-playlist",
+      "--no-warnings",
+      "--yes-playlist",
+      "--playlist-end",
+      String(MAX_PLAYLIST_ENTRIES),
+      url,
+    ]);
+    const playlist = JSON.parse(rawPlaylist);
+    entries = normalizePlaylistEntries(playlist.entries || []).slice(0, MAX_PLAYLIST_ENTRIES);
+    if (!entries.length) {
+      return res.status(400).json({ error: "Playlist has no downloadable entries." });
+    }
+
+    const playlistTitle = sanitizeFilename(playlist.title || "Playlist");
+    const outputExt = isAudio ? "mp3" : "mp4";
+
+    // Headers must be set before archiver starts writing
+    res.setHeader("Content-Type", "application/zip");
+    res.setHeader("Content-Disposition", buildContentDisposition(playlistTitle + ".zip"));
+    res.setHeader("Cache-Control", "no-store");
+
+    const archive = archiver("zip", { zlib: { level: 0 } }); // level 0 = store, no re-compress
+    archive.on("warning", (err) => console.warn("[playlist-zip] archiver warning:", err.message));
+    archive.on("error", (err) => {
+      console.error("[playlist-zip] archiver error:", err.message);
+      // Headers already sent — can only destroy
+      res.destroy(err);
+    });
+    archive.pipe(res);
+
+    for (let i = 0; i < entries.length; i++) {
+      const entry = entries[i];
+      const title = sanitizeFilename(entry.title) || "video-" + (i + 1);
+      const filename = title + "." + outputExt;
+
+      console.log("[playlist-zip] downloading", i + 1 + "/" + entries.length, title);
+
+      try {
+        await new Promise((resolve, reject) => {
+          const args = withCookies(buildDownloadArgs(formatId, isAudio, "-"));
+          args.push(entry.url);
+          const proc = spawn(YT_DLP, args, { stdio: ["ignore", "pipe", "pipe"] });
+
+          let stderrBuf = "";
+          proc.stderr.on("data", (d) => {
+            const line = d.toString().trim();
+            if (line) {
+              stderrBuf += line + "\n";
+              console.log("[yt-dlp zip]", line);
+            }
+          });
+
+          archive.append(proc.stdout, { name: filename });
+
+          proc.on("error", reject);
+          proc.on("close", (code) => {
+            if (code !== 0) {
+              reject(new Error(stderrBuf.trim().slice(-300) || "yt-dlp exited with code " + code));
+            } else {
+              resolve();
+            }
+          });
+        });
+      } catch (err) {
+        console.error("[playlist-zip] failed entry", entry.url, err.message);
+        // Append a small error text file in place of the failed video so the zip is still useful
+        archive.append("Download failed: " + err.message.slice(0, 300), {
+          name: "FAILED - " + sanitizeFilename(entry.title || "video-" + (i + 1)) + ".txt",
+        });
+      }
+    }
+
+    await archive.finalize();
+  } catch (err) {
+    console.error("[playlist-zip]", err.message);
+    if (!res.headersSent) {
+      return res.status(500).json({ error: "Playlist ZIP failed: " + err.message.slice(0, 300) });
+    }
+    res.destroy(err);
+  }
+});
 
 // GET /api/download — legacy direct stream (used by playlist iframe fallback)
 app.use("/api/download", directDownloadLimiter);

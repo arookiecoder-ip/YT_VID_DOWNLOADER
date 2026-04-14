@@ -1510,7 +1510,7 @@
           updateTrayCard(cardId, 92, 'Packing ZIP…', 'Finalising archive');
         });
 
-        sse.addEventListener('error', (e) => {
+        sse.addEventListener('zip-error', (e) => {
           try {
             const d = JSON.parse(e.data);
             console.warn('[SSE] server error:', d.error);

@@ -1532,6 +1532,12 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
 
     let completed = 0;
     let failed = 0;
+    // Temp files created per video; cleaned up after each one is added to archive
+    const tempFiles = [];
+
+    // Whether this format requires ffmpeg merging (video+audio streams)
+    // yt-dlp cannot merge to stdout — must write to a temp file first
+    const needsMerge = !isAudio && formatId.includes("+");
 
     for (let i = 0; i < entries.length; i++) {
       const entry = entries[i];
@@ -1541,37 +1547,77 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
       emit("downloading", { current: i + 1, total, title: entry.title || title });
       console.log("[playlist-zip]", (i + 1) + "/" + total, title);
 
+      let tempPath = null;
       try {
-        await new Promise((resolve, reject) => {
-          const args = withCookies(buildDownloadArgs(formatId, isAudio, "-"));
-          args.push(entry.url);
-          const proc = spawn(YT_DLP, args, { stdio: ["ignore", "pipe", "pipe"] });
+        if (needsMerge) {
+          // Merged formats (e.g. bestvideo+bestaudio) require ffmpeg post-processing.
+          // yt-dlp cannot pipe a merged output to stdout — it writes separate streams
+          // then muxes them. We download to a temp file, add it to the archive, then delete it.
+          tempPath = path.join(os.tmpdir(), "plzip-" + crypto.randomUUID() + "." + outputExt);
+          tempFiles.push(tempPath);
 
-          let stderrBuf = "";
-          proc.stderr.on("data", (d) => {
-            const line = d.toString().trim();
-            if (line) {
-              stderrBuf += line + "\n";
-              // Forward merge/mux stage to frontend
-              if (/\[Merger\]|\[ffmpeg\]|Merging/i.test(line)) {
-                emit("merging", { current: i + 1, total, title: entry.title || title });
+          await new Promise((resolve, reject) => {
+            const args = withCookies(buildDownloadArgs(formatId, isAudio, tempPath));
+            args.push(entry.url);
+            const proc = spawn(YT_DLP, args, { stdio: ["ignore", "pipe", "pipe"] });
+
+            let stderrBuf = "";
+            proc.stderr.on("data", (d) => {
+              const line = d.toString().trim();
+              if (line) {
+                stderrBuf += line + "\n";
+                if (/\[Merger\]|\[ffmpeg\]|Merging/i.test(line)) {
+                  emit("merging", { current: i + 1, total, title: entry.title || title });
+                }
               }
-            }
+            });
+            proc.stdout.on("data", () => {}); // drain stdout
+            proc.on("error", reject);
+            proc.on("close", (code) => {
+              if (code !== 0) reject(new Error(stderrBuf.trim().slice(-300) || "yt-dlp exited with code " + code));
+              else resolve();
+            });
           });
 
-          archive.append(proc.stdout, { name: filename });
-          proc.on("error", reject);
-          proc.on("close", (code) => {
-            if (code !== 0) reject(new Error(stderrBuf.trim().slice(-300) || "yt-dlp exited with code " + code));
-            else resolve();
+          // Append completed temp file into archive, then delete it once archiver
+          // has finished reading it (the 'entry' event fires after each entry is processed)
+          await new Promise((resolve, reject) => {
+            archive.once("entry", () => {
+              try { fs.unlinkSync(tempPath); } catch {}
+              tempFiles.splice(tempFiles.indexOf(tempPath), 1);
+              resolve();
+            });
+            archive.file(tempPath, { name: filename });
           });
-        });
+
+        } else {
+          // Single-stream formats (audio or single video quality) can pipe stdout directly
+          await new Promise((resolve, reject) => {
+            const args = withCookies(buildDownloadArgs(formatId, isAudio, "-"));
+            args.push(entry.url);
+            const proc = spawn(YT_DLP, args, { stdio: ["ignore", "pipe", "pipe"] });
+
+            let stderrBuf = "";
+            proc.stderr.on("data", (d) => {
+              const line = d.toString().trim();
+              if (line) stderrBuf += line + "\n";
+            });
+
+            archive.append(proc.stdout, { name: filename });
+            proc.on("error", reject);
+            proc.on("close", (code) => {
+              if (code !== 0) reject(new Error(stderrBuf.trim().slice(-300) || "yt-dlp exited with code " + code));
+              else resolve();
+            });
+          });
+        }
 
         completed++;
         emit("done", { current: i + 1, total, title: entry.title || title, completed, failed });
       } catch (err) {
         failed++;
         console.error("[playlist-zip] failed:", entry.url, err.message);
+        if (tempPath) { try { fs.unlinkSync(tempPath); } catch {} }
         archive.append("Download failed: " + err.message.slice(0, 300), {
           name: "FAILED - " + sanitizeFilename(entry.title || "video-" + (i + 1)) + ".txt",
         });
@@ -1580,11 +1626,13 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
     }
 
     await archive.finalize();
+    // Clean up any leftover temp files (shouldn't happen, but safety net)
+    for (const f of tempFiles) { try { fs.unlinkSync(f); } catch {} }
     emit("complete", { total, completed, failed });
     closeProgress();
   } catch (err) {
     console.error("[playlist-zip]", err.message);
-    emit("error", { error: err.message.slice(0, 300) });
+    emit("zip-error", { error: err.message.slice(0, 300) });
     closeProgress();
     if (!res.headersSent) {
       return res.status(500).json({ error: "Playlist ZIP failed: " + err.message.slice(0, 300) });

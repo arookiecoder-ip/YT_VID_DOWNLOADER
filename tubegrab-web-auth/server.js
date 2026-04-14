@@ -727,6 +727,7 @@ async function probeDownloadSize(url, formatId, isAudio) {
 function buildDownloadArgs(formatId, isAudio, outputTarget = "-") {
   const selector = getFormatSelector(formatId, isAudio);
   const args = [
+    "--js-runtimes", "node",
     "--no-warnings",
     "--no-playlist",
     "--no-check-certificates",

@@ -169,15 +169,24 @@
       box-shadow: 0 0 0 4px rgba(255, 51, 102, 0.1), 0 8px 24px rgba(0, 0, 0, 0.3);
     }
 
+    .search-input-wrap {
+      flex: 1;
+      position: relative;
+      display: flex;
+      align-items: center;
+      min-width: 0;
+    }
+
     .search-box input {
       flex: 1;
+      width: 100%;
       background: transparent;
       border: none;
       outline: none;
       color: var(--text);
       font-family: var(--mono);
       font-size: 0.88rem;
-      padding: 14px 16px;
+      padding: 14px 44px 14px 16px;
     }
 
     .search-box input::placeholder {
@@ -224,27 +233,32 @@
     }
 
     .btn-clear {
+      position: absolute;
+      right: 8px;
+      top: 50%;
+      transform: translateY(-50%);
       display: inline-flex;
       align-items: center;
       justify-content: center;
-      width: 36px;
-      background: var(--surface-2);
+      width: 26px;
+      height: 26px;
+      padding: 0;
+      background: var(--surface-3);
       color: var(--text-dim);
-      border: 1px solid var(--border);
-      border-radius: var(--radius-sm);
+      border: none;
+      border-radius: 50%;
       cursor: pointer;
-      transition: color 0.15s, background 0.15s, border-color 0.15s;
+      transition: color 0.15s, background 0.15s;
     }
 
     .btn-clear:hover {
-      color: var(--accent);
-      background: var(--surface-3);
-      border-color: var(--accent);
+      color: #fff;
+      background: var(--accent);
     }
 
     .btn-clear svg {
-      width: 16px;
-      height: 16px;
+      width: 14px;
+      height: 14px;
       fill: currentColor;
     }
 
@@ -862,10 +876,12 @@
 
     <section class="search-section">
       <div class="search-box">
-        <input type="text" id="urlInput" placeholder="Paste a YouTube URL here…" spellcheck="false" autocomplete="off">
-        <button type="button" class="btn-clear" id="clearBtn" onclick="clearSearch()" title="Clear" aria-label="Clear search" hidden>
-          <svg viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
-        </button>
+        <div class="search-input-wrap">
+          <input type="text" id="urlInput" placeholder="Paste a YouTube URL here…" spellcheck="false" autocomplete="off">
+          <button type="button" class="btn-clear" id="clearBtn" onclick="clearSearch()" title="Clear" aria-label="Clear search" hidden>
+            <svg viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+          </button>
+        </div>
         <button class="btn-fetch" id="fetchBtn" onclick="fetchVideo()">
           <svg viewBox="0 0 24 24">
             <path

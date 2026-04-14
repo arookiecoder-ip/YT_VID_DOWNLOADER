@@ -58,6 +58,10 @@ const DOWNLOAD_START_RATE_LIMIT_MAX = parsePositiveEnvInt(
 );
 const MAX_PLAYLIST_ENTRIES = parsePositiveEnvInt(process.env.MAX_PLAYLIST_ENTRIES, 50);
 const MAX_CONCURRENT_JOBS = parsePositiveEnvInt(process.env.MAX_CONCURRENT_JOBS, 25);
+// Max parallel yt-dlp processes per playlist ZIP (higher = faster but more RAM/CPU)
+const PLAYLIST_CONCURRENCY = parsePositiveEnvInt(process.env.PLAYLIST_CONCURRENCY, 3);
+// Max concurrent jobs per IP (prevents one user starving others)
+const MAX_JOBS_PER_IP = parsePositiveEnvInt(process.env.MAX_JOBS_PER_IP, 5);
 const MAX_INPUT_URL_LENGTH = 2048;
 const DEBUG_API_ERRORS =
   String(process.env.DEBUG_API_ERRORS || "").trim().toLowerCase() === "1" ||
@@ -411,14 +415,23 @@ function withCookies(args) {
   return args;
 }
 
+function extractUsefulError(stderr, fallback) {
+  // Pull the most meaningful line from yt-dlp stderr (last non-empty ERROR: line, else last line)
+  const lines = String(stderr || "").split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+  const errorLine = [...lines].reverse().find(l => /^ERROR:/i.test(l));
+  const useful = (errorLine || lines[lines.length - 1] || fallback || "yt-dlp failed")
+    .replace(/^ERROR:\s*/i, "").trim();
+  return useful.slice(0, 400);
+}
+
 function runYtDlpRaw(args) {
   return new Promise((resolve, reject) => {
     execFile(
       YT_DLP,
       args,
-      { timeout: 90000, maxBuffer: 20 * 1024 * 1024 },
+      { timeout: 120000, maxBuffer: 20 * 1024 * 1024 },
       (err, stdout, stderr) => {
-        if (err) return reject(new Error((stderr || err.message || "yt-dlp failed").trim()));
+        if (err) return reject(new Error(extractUsefulError(stderr, err.message)));
         resolve(stdout.trim());
       },
     );
@@ -426,21 +439,31 @@ function runYtDlpRaw(args) {
 }
 
 async function runYtDlp(args) {
-  // Primary: use Node.js JS runtime for n-challenge solving.
-  const primaryArgs = ["--js-runtimes", "node", ...withCookies(args)];
+  // Always include a socket timeout so yt-dlp doesn't hang on flaky connections
+  const baseArgs = ["--js-runtimes", "node", "--socket-timeout", "30", ...withCookies(args)];
   try {
-    return await runYtDlpRaw(primaryArgs);
+    return await runYtDlpRaw(baseArgs);
   } catch (err) {
     const msg = err.message || "";
     const isChallenge =
       /Sign in to confirm|n.challenge|nsig|challenge solving/i.test(msg) ||
       /HTTP Error 429|Too Many Requests/i.test(msg) ||
       /Only images are available/i.test(msg);
+    const isTransient =
+      /connection reset|connection timed out|socket timeout|network/i.test(msg);
+
+    if (isTransient) {
+      // One automatic retry for transient network errors
+      console.warn("[yt-dlp] transient error, retrying once:", msg.slice(0, 120));
+      await new Promise(r => setTimeout(r, 2000));
+      return runYtDlpRaw(baseArgs);
+    }
     if (!isChallenge) throw err;
-    // Retry with tv_embedded player client as fallback
+    // Retry with tv_embedded player client as fallback for n-challenge
     console.warn("[yt-dlp] n-challenge detected, retrying with tv_embedded…");
     const fallbackArgs = [
       "--js-runtimes", "node",
+      "--socket-timeout", "30",
       "--extractor-args", "youtube:player_client=tv_embedded",
       ...withCookies(args),
     ];
@@ -966,20 +989,9 @@ app.get("/api/info", async (req, res) => {
     });
   } catch (err) {
     console.error("[/api/info]", err.message);
-    const rawMsg = String(err.message || "").trim();
-
-    // Extract the most useful line from yt-dlp stderr output.
-    // yt-dlp often emits multi-line stderr; the last non-empty line is the real error.
-    const usefulLine = rawMsg
-      .split(/\r?\n/)
-      .map((l) => l.replace(/^ERROR:\s*/i, "").trim())
-      .filter(Boolean)
-      .pop() || "Unknown error from yt-dlp";
-
-    const detail = usefulLine.slice(0, 300);
-
+    const detail = extractUsefulError(err.message, "Failed to fetch video info");
     if (DEBUG_API_ERRORS) {
-      return res.status(500).json({ error: detail, debug: rawMsg.slice(0, 500) });
+      return res.status(500).json({ error: detail, debug: String(err.message || "").slice(0, 500) });
     }
     res.status(500).json({ error: detail });
   }
@@ -1207,12 +1219,14 @@ function remuxMp4(inputPath) {
 
 async function fetchVideoTitle(url) {
   try {
-    return await runYtDlp([
-      "--get-title",
+    // --print title is faster than --get-title (no extra API call inside yt-dlp)
+    const result = await runYtDlp([
+      "--print", "title",
       "--no-warnings",
       "--no-playlist",
       url,
     ]);
+    return result.split(/\r?\n/)[0].trim() || "video";
   } catch {
     return "video";
   }
@@ -1293,32 +1307,36 @@ app.post("/api/download/start", downloadStartLimiter, async (req, res) => {
     }
   }
 
+  const clientId = getClientId(req);
+
   // Atomic check-and-create: no await between the count check and Map insertion.
   // JS is single-threaded so this is safe as long as there's no await in between.
   if (countActiveJobs() >= MAX_CONCURRENT_JOBS) {
-    res.set("Retry-After", "60");
-    return res.status(429).json({ error: "Server is busy. Please try again in a minute." });
+    res.set("Retry-After", "30");
+    return res.status(429).json({ error: "Server is busy. Please try again shortly." });
   }
   if (jobs.size >= JOB_MAP_CAP) {
     return res.status(503).json({ error: "Job queue is full. Please try again shortly." });
   }
+  // Per-IP fairness: prevent one client from monopolising the queue
+  const jobsForIp = [...jobs.values()].filter(j => j.state === "pending" && j.clientId === clientId).length;
+  if (jobsForIp >= MAX_JOBS_PER_IP) {
+    res.set("Retry-After", "30");
+    return res.status(429).json({ error: "You have too many downloads in progress. Wait for one to finish." });
+  }
 
   const token = crypto.randomBytes(32).toString("hex");
-  const clientId = getClientId(req);
   createJob(token, { url, formatId, isAudio, clientId });
   runDownloadJob(token, url, formatId, isAudio);
 
   res.json({ token });
 });
 
-// GET /api/download/status/:token — poll for job progress
+// GET /api/download/status/:token — poll for job progress (no clientId check — share with any device)
 app.get("/api/download/status/:token", (req, res) => {
   const token = String(req.params.token || "").trim();
   const job = jobs.get(token);
   if (!job) return res.status(404).json({ error: "Job not found or expired" });
-  if (job.clientId && job.clientId !== getClientId(req)) {
-    return res.status(404).json({ error: "Job not found or expired" });
-  }
 
   res.json({
     state: job.state,
@@ -1330,15 +1348,13 @@ app.get("/api/download/status/:token", (req, res) => {
   });
 });
 
-// GET /api/download/file/:token — stream the finished file, then clean up
+// GET /api/download/file/:token — stream the finished file.
+// File is deleted 60s after first serve so multiple devices can re-download within that window.
 app.get("/api/download/file/:token", (req, res) => {
   const token = String(req.params.token || "").trim();
   const job = jobs.get(token);
 
   if (!job) return res.status(404).json({ error: "Job not found or expired" });
-  if (job.clientId && job.clientId !== getClientId(req)) {
-    return res.status(404).json({ error: "Job not found or expired" });
-  }
   if (job.state === "pending") return res.status(202).json({ error: "Download not ready yet" });
   if (job.state === "error") return res.status(500).json({ error: job.error || "Download failed" });
   if (!job.filePath || !fs.existsSync(job.filePath)) {
@@ -1353,13 +1369,17 @@ app.get("/api/download/file/:token", (req, res) => {
     "Content-Length": String(job.fileSize),
   });
 
+  // Schedule cleanup 60s after the first serve — gives other devices time to download
+  if (!job.servedAt) {
+    updateJob(token, { servedAt: Date.now() });
+    setTimeout(() => cleanupJob(token), 60 * 1000).unref();
+  }
+
   const fileStream = fs.createReadStream(job.filePath);
   fileStream.on("error", (err) => {
-    cleanupJob(token);
     if (!res.headersSent) res.status(500).json({ error: "File read failed: " + err.message });
     else res.destroy(err);
   });
-  fileStream.on("close", () => cleanupJob(token));
   fileStream.pipe(res);
 });
 
@@ -1483,12 +1503,14 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
 
   // Abort controller — triggered when client disconnects or hits /cancel
   let aborted = false;
-  let currentProc = null; // the yt-dlp process currently running
+  let currentProc = null; // tracks the most recently spawned yt-dlp (for abort signalling)
+  const activeProcs = new Set(); // all running yt-dlp processes for this job
   const abort = (reason = "cancelled") => {
     if (aborted) return;
     aborted = true;
     console.log("[playlist-zip] aborting:", reason);
-    if (currentProc) { try { currentProc.kill("SIGKILL"); } catch {} }
+    for (const p of activeProcs) { try { p.kill("SIGKILL"); } catch {} }
+    activeProcs.clear();
   };
 
   // Register this job so /cancel can reach it
@@ -1559,107 +1581,133 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
 
     let completed = 0;
     let failed = 0;
+    let finishedCount = 0; // tracks how many videos have fully resolved (done or failed)
 
-    // Whether this format requires ffmpeg merging (video+audio streams)
-    // yt-dlp cannot merge to stdout — must write to a temp file first
+    // Whether this format requires ffmpeg merging (video+audio streams).
+    // yt-dlp cannot merge to stdout — must write to a temp file first.
     const needsMerge = !isAudio && formatId.includes("+");
 
-    for (let i = 0; i < entries.length; i++) {
-      if (aborted) break;
+    // Downloads N videos in parallel (PLAYLIST_CONCURRENCY at a time).
+    // Each slot downloads to a temp file, then adds it to the archive sequentially
+    // so archiver doesn't receive interleaved streams.
+    // A mutex (archiveLock) ensures only one video is being appended to the archive at a time.
+    let archiveLock = Promise.resolve();
 
-      const entry = entries[i];
+    // Download a single entry to a temp file and resolve with { tempPath, filename, entry, index }
+    const downloadEntry = (entry, i) => new Promise((resolve, reject) => {
+      if (aborted) return reject(new Error("cancelled"));
+
       const title = sanitizeFilename(entry.title) || "video-" + (i + 1);
       const filename = title + "." + outputExt;
+      const tempPath = path.join(os.tmpdir(), "plzip-" + crypto.randomUUID() + "." + outputExt);
+      tempFiles.add(tempPath);
 
       emit("downloading", { current: i + 1, total, title: entry.title || title });
-      console.log("[playlist-zip]", (i + 1) + "/" + total, title);
+      console.log("[playlist-zip] downloading", (i + 1) + "/" + total, title);
 
-      let tempPath = null;
-      try {
-        if (needsMerge) {
-          // Merged formats (e.g. bestvideo+bestaudio) require ffmpeg post-processing.
-          // yt-dlp cannot pipe a merged output to stdout — download to temp file first.
-          tempPath = path.join(os.tmpdir(), "plzip-" + crypto.randomUUID() + "." + outputExt);
-          tempFiles.add(tempPath);
+      const args = withCookies(buildDownloadArgs(formatId, isAudio, needsMerge ? tempPath : "-"));
+      args.push(entry.url);
+      const proc = spawn(YT_DLP, args, { stdio: ["ignore", needsMerge ? "ignore" : "pipe", "pipe"] });
+      currentProc = proc;
+      activeProcs.add(proc);
 
-          await new Promise((resolve, reject) => {
-            const args = withCookies(buildDownloadArgs(formatId, isAudio, tempPath));
-            args.push(entry.url);
-            const proc = spawn(YT_DLP, args, { stdio: ["ignore", "pipe", "pipe"] });
-            currentProc = proc;
-
-            let stderrBuf = "";
-            proc.stderr.on("data", (d) => {
-              const line = d.toString().trim();
-              if (line) {
-                stderrBuf += line + "\n";
-                if (/\[Merger\]|\[ffmpeg\]|Merging/i.test(line)) {
-                  emit("merging", { current: i + 1, total, title: entry.title || title });
-                }
-              }
-            });
-            proc.stdout.on("data", () => {}); // drain stdout
-            proc.on("error", reject);
-            proc.on("close", (code) => {
-              currentProc = null;
-              if (aborted) return reject(new Error("cancelled"));
-              if (code !== 0) reject(new Error(stderrBuf.trim().slice(-300) || "yt-dlp exited with code " + code));
-              else resolve();
-            });
-          });
-
-          if (aborted) { try { fs.unlinkSync(tempPath); } catch {} tempFiles.delete(tempPath); break; }
-
-          // Append completed temp file into archive, delete once archiver has read it
-          await new Promise((resolve) => {
-            archive.once("entry", () => {
-              try { fs.unlinkSync(tempPath); } catch {}
-              tempFiles.delete(tempPath);
-              resolve();
-            });
-            archive.file(tempPath, { name: filename });
-          });
-
-        } else {
-          // Single-stream formats can pipe stdout directly
-          await new Promise((resolve, reject) => {
-            const args = withCookies(buildDownloadArgs(formatId, isAudio, "-"));
-            args.push(entry.url);
-            const proc = spawn(YT_DLP, args, { stdio: ["ignore", "pipe", "pipe"] });
-            currentProc = proc;
-
-            let stderrBuf = "";
-            proc.stderr.on("data", (d) => {
-              const line = d.toString().trim();
-              if (line) stderrBuf += line + "\n";
-            });
-
-            archive.append(proc.stdout, { name: filename });
-            proc.on("error", reject);
-            proc.on("close", (code) => {
-              currentProc = null;
-              if (aborted) return reject(new Error("cancelled"));
-              if (code !== 0) reject(new Error(stderrBuf.trim().slice(-300) || "yt-dlp exited with code " + code));
-              else resolve();
-            });
-          });
+      let stderrBuf = "";
+      proc.stderr.on("data", (d) => {
+        const line = d.toString().trim();
+        if (line) {
+          stderrBuf += line + "\n";
+          if (/\[Merger\]|\[ffmpeg\]|Merging/i.test(line)) {
+            emit("merging", { current: i + 1, total, title: entry.title || title });
+          }
         }
+      });
 
-        if (aborted) break;
-        completed++;
-        emit("done", { current: i + 1, total, title: entry.title || title, completed, failed });
-      } catch (err) {
-        if (aborted) break; // don't log noise on intentional cancel
-        failed++;
-        console.error("[playlist-zip] failed:", entry.url, err.message);
-        if (tempPath) { try { fs.unlinkSync(tempPath); } catch {} tempFiles.delete(tempPath); }
-        archive.append("Download failed: " + err.message.slice(0, 300), {
-          name: "FAILED - " + sanitizeFilename(entry.title || "video-" + (i + 1)) + ".txt",
-        });
-        emit("failed", { current: i + 1, total, title: entry.title || title, completed, failed, error: err.message.slice(0, 200) });
+      if (!needsMerge) {
+        // For single-stream, collect stdout into a temp file so parallel downloads
+        // don't interleave — each finishes independently then gets appended in order
+        const writeStream = fs.createWriteStream(tempPath);
+        proc.stdout.pipe(writeStream);
+        writeStream.on("error", reject);
       }
-    }
 
+      proc.on("error", (err) => { activeProcs.delete(proc); reject(err); });
+      proc.on("close", (code) => {
+        activeProcs.delete(proc);
+        if (aborted) return reject(new Error("cancelled"));
+        if (code !== 0) {
+          const msg = extractUsefulError(stderrBuf, "yt-dlp exited with code " + code);
+          return reject(new Error(msg));
+        }
+        resolve({ tempPath, filename, entry, index: i });
+      });
+    });
+
+    // Add a completed temp file into the archive (serialised via archiveLock)
+    const appendToArchive = ({ tempPath, filename, entry, index }) => {
+      archiveLock = archiveLock.then(() => new Promise((resolve) => {
+        if (aborted || !fs.existsSync(tempPath)) {
+          try { fs.unlinkSync(tempPath); } catch {}
+          tempFiles.delete(tempPath);
+          return resolve();
+        }
+        archive.once("entry", () => {
+          try { fs.unlinkSync(tempPath); } catch {}
+          tempFiles.delete(tempPath);
+          resolve();
+        });
+        archive.file(tempPath, { name: filename });
+      }));
+      return archiveLock;
+    };
+
+    // Run downloads with a concurrency pool
+    const semaphore = { running: 0, queue: [] };
+    const acquireSemaphore = () => new Promise(resolve => {
+      if (semaphore.running < PLAYLIST_CONCURRENCY) {
+        semaphore.running++;
+        resolve();
+      } else {
+        semaphore.queue.push(resolve);
+      }
+    });
+    const releaseSemaphore = () => {
+      if (semaphore.queue.length > 0) {
+        const next = semaphore.queue.shift();
+        next();
+      } else {
+        semaphore.running--;
+      }
+    };
+
+    const entryPromises = entries.map((entry, i) => (async () => {
+      if (aborted) return;
+      await acquireSemaphore();
+      try {
+        const result = await downloadEntry(entry, i);
+        if (!aborted) {
+          await appendToArchive(result);
+          completed++;
+          finishedCount++;
+          emit("done", { current: finishedCount, total, title: entry.title || result.filename, completed, failed });
+        }
+      } catch (err) {
+        finishedCount++;
+        if (aborted) return;
+        failed++;
+        const title = sanitizeFilename(entry.title) || "video-" + (i + 1);
+        console.error("[playlist-zip] failed:", entry.url, err.message);
+        archive.append("Download failed: " + err.message.slice(0, 300), {
+          name: "FAILED - " + title + ".txt",
+        });
+        emit("failed", { current: finishedCount, total, title: entry.title || title, completed, failed, error: err.message.slice(0, 200) });
+      } finally {
+        releaseSemaphore();
+      }
+    })());
+
+    await Promise.all(entryPromises);
+    // Wait for all archive appends to finish
+    await archiveLock;
     cleanupTempFiles();
 
     if (!aborted) {

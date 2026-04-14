@@ -739,12 +739,14 @@ async function runDownloadJob(token, url, formatId, isAudio) {
         const proc = spawn(YT_DLP, ytdlpArgs, { stdio: ["ignore", "pipe", "pipe"] });
         let stderr = "";
         let lastProgress = 5;
+        let lastActivityAt = Date.now();
 
-        proc.stderr.on("data", (chunk) => {
-          const text = chunk.toString();
-          stderr += text;
-          // Parse yt-dlp progress lines like "[download]  42.3% of ..."
-          const m = text.match(/(\d+(?:\.\d+)?)%/);
+        const handleOutput = (text, isErr) => {
+          lastActivityAt = Date.now();
+          // yt-dlp emits progress to STDOUT (e.g. "[download]  42.3% of ...").
+          // We MUST drain stdout as well or the pipe buffer fills and yt-dlp
+          // blocks, which manifests as the download getting "stuck".
+          const m = text.match(/\[download\]\s+(\d+(?:\.\d+)?)%/);
           if (m) {
             const pct = Math.min(80, Math.round(5 + (parseFloat(m[1]) / 100) * 70));
             if (pct > lastProgress) {
@@ -752,15 +754,35 @@ async function runDownloadJob(token, url, formatId, isAudio) {
               updateJob(token, { progress: pct });
             }
           }
+          if (/\[Merger\]|\[ExtractAudio\]|post-process/i.test(text)) {
+            updateJob(token, { stage: "Merging…", progress: Math.max(lastProgress, 78) });
+          }
+          if (isErr) stderr += text;
           const line = text.trim();
           if (line) console.error("[job:" + token.slice(0, 6) + "]", line);
-        });
+        };
+
+        proc.stdout.on("data", (chunk) => handleOutput(chunk.toString(), false));
+        proc.stderr.on("data", (chunk) => handleOutput(chunk.toString(), true));
+
+        // Watchdog: if no progress activity for 2 minutes, kill the process.
+        const watchdog = setInterval(() => {
+          if (Date.now() - lastActivityAt > 120000) {
+            try { proc.kill("SIGKILL"); } catch {}
+          }
+        }, 15000);
+
         proc.on("close", (code) => {
+          clearInterval(watchdog);
           if (code === 0) { resolve(); return; }
           removeFileQuietly(tempPath);
           reject(new Error(stderr.trim().slice(-300) || "yt-dlp exited with code " + code));
         });
-        proc.on("error", (err) => { removeFileQuietly(tempPath); reject(err); });
+        proc.on("error", (err) => {
+          clearInterval(watchdog);
+          removeFileQuietly(tempPath);
+          reject(err);
+        });
       }),
     ]);
 
@@ -772,7 +794,7 @@ async function runDownloadJob(token, url, formatId, isAudio) {
       await new Promise((resolve, reject) => {
         const proc = spawn("ffmpeg", [
           "-i", tempPath, "-c", "copy", "-movflags", "+faststart", "-y", remuxedPath,
-        ], { stdio: ["ignore", "pipe", "pipe"] });
+        ], { stdio: ["ignore", "ignore", "pipe"] });
         let stderr = "";
         proc.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
         proc.on("close", (code) => {
@@ -906,6 +928,12 @@ async function streamDownload(req, res) {
       new Promise((resolve, reject) => {
         const proc = spawn(YT_DLP, ytdlpArgs, { stdio: ["ignore", "pipe", "pipe"] });
         let stderr = "";
+        // Drain stdout as well — yt-dlp writes progress there and will block if
+        // the pipe buffer fills.
+        proc.stdout.on("data", (chunk) => {
+          const line = chunk.toString().trim();
+          if (line) console.error("[/api/download]", line);
+        });
         proc.stderr.on("data", (chunk) => {
           stderr += chunk.toString();
           const line = chunk.toString().trim();
@@ -927,7 +955,7 @@ async function streamDownload(req, res) {
       await new Promise((resolve, reject) => {
         const proc = spawn("ffmpeg", [
           "-i", tempPath, "-c", "copy", "-movflags", "+faststart", "-y", remuxedPath,
-        ], { stdio: ["ignore", "pipe", "pipe"] });
+        ], { stdio: ["ignore", "ignore", "pipe"] });
         let stderr = "";
         proc.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
         proc.on("close", (code) => {

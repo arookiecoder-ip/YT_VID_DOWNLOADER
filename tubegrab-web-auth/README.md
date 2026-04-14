@@ -65,7 +65,8 @@ $env:AUTH_PASSWORD="your-password"
 node server.js
 ```
 
-If credentials are not set, the server falls back to `admin` / `change-me-now` and prints a warning.
+In `production`, credentials must be explicitly set via environment variables.
+If `AUTH_USERNAME`/`AUTH_PASSWORD` are missing in production, startup fails.
 
 ## Firewall Controls
 
@@ -74,7 +75,8 @@ This protected variant includes built-in hardening:
 - HTTP Basic Auth for all routes
 - Brute-force protection by IP (`AUTH_MAX_FAILURES`, `AUTH_BLOCK_MINUTES`)
 - Global request rate limiting (`GLOBAL_RATE_LIMIT_WINDOW_MS`, `GLOBAL_RATE_LIMIT_MAX`)
-- Download route rate limiting (`DOWNLOAD_RATE_LIMIT_MAX`)
+- Direct download stream rate limiting (`DOWNLOAD_RATE_LIMIT_MAX`)
+- Job queue start rate limiting (`DOWNLOAD_START_RATE_LIMIT_MAX`)
 - Security headers via Helmet
 
 You can configure these values via environment variables (see `.env.example`).
@@ -103,13 +105,44 @@ docker run -d -p 3000:3000 --name tubegrab tubegrab
 
 The container includes Python 3, ffmpeg, and yt-dlp — no extra setup needed.
 
+## Testing
+
+Run unit tests with Node's built-in test runner:
+
+```bash
+npm test
+```
+
+Current tests cover core URL validation and auth/client-id utility behavior.
+
+## CI and Security Checks
+
+This project now includes a GitHub Actions workflow at `.github/workflows/ci-security.yml` that runs:
+
+- Unit tests (`npm test`)
+- Dependency vulnerability audit (`npm audit --audit-level=high`)
+- Docker image build + Trivy scan for HIGH/CRITICAL findings
+
 ## Environment Variables
 
-| Variable      | Default  | Description                        |
-| ------------- | -------- | ---------------------------------- |
-| `PORT`        | `3000`   | HTTP server port                   |
-| `YT_DLP_PATH` | `yt-dlp` | Path to the yt-dlp binary          |
-| `NODE_ENV`    | —        | Set to `production` for deployment |
+| Variable                        | Default              | Description |
+| ------------------------------- | -------------------- | ----------- |
+| `AUTH_USERNAME`                 | `admin` (dev only)   | HTTP Basic auth username. Must be explicitly set for production. |
+| `AUTH_PASSWORD`                 | `change-me-now` (dev only) | HTTP Basic auth password. Must be explicitly set for production. |
+| `AUTH_REALM`                    | `TubeGrab Protected` | Browser auth prompt realm. |
+| `AUTH_MAX_FAILURES`             | `10`                 | Failed auth attempts allowed before temporary block. |
+| `AUTH_BLOCK_MINUTES`            | `15`                 | Block duration after too many failed auth attempts. |
+| `TRUST_PROXY`                   | unset                | Proxy trust setting. Use `1` behind a trusted reverse proxy. |
+| `GLOBAL_RATE_LIMIT_WINDOW_MS`   | `60000`              | Global rate-limit window size in ms. |
+| `GLOBAL_RATE_LIMIT_MAX`         | `120`                | Max requests per global window. |
+| `DOWNLOAD_RATE_LIMIT_MAX`       | `8`                  | Max legacy direct stream requests per minute (`/api/download`). |
+| `DOWNLOAD_START_RATE_LIMIT_MAX` | `60`                 | Max queued job starts per minute (`/api/download/start`). |
+| `MAX_PLAYLIST_ENTRIES`          | `50`                 | Maximum playlist entries returned by `/api/info`. |
+| `MAX_CONCURRENT_JOBS`           | `25`                 | Maximum active background download jobs. |
+| `YTDLP_COOKIES`                 | unset                | Optional cookies file path for yt-dlp. |
+| `PORT`                          | `3000`               | HTTP server port. |
+| `YT_DLP_PATH`                   | `yt-dlp`             | Path to the yt-dlp binary. |
+| `NODE_ENV`                      | unset                | Set to `production` for deployment mode. |
 
 ## API Endpoints
 
@@ -169,6 +202,36 @@ Starts and streams a video/audio download directly to the browser.
 
 When the selected format has a known exact size, the response includes `Content-Length` so browser download managers can show total bytes from the start.
 
+### `POST /api/download/start`
+
+Starts a background download job and returns a token immediately.
+
+**Request body:**
+
+```json
+{
+  "url": "https://www.youtube.com/watch?v=dQw4w9WgXcQ",
+  "formatId": "137",
+  "ext": "mp4"
+}
+```
+
+**Response:**
+
+```json
+{
+  "token": "<job_token>"
+}
+```
+
+### `GET /api/download/status/:token`
+
+Returns job status (`pending`, `done`, `error`) and progress metadata.
+
+### `GET /api/download/file/:token`
+
+Streams the completed file for a finished job token.
+
 ### `POST /api/download`
 
 Backward-compatible alias for the same download behavior (accepts JSON body with `url`, `formatId`, `ext`).
@@ -198,7 +261,7 @@ Health check. Returns `{ "status": "ok", "ytdlp": "yt-dlp", "timestamp": "..." }
 ## Project Structure
 
 ```
-tubegrab/
+tubegrab-web-auth/
 ├── server.js           # Express backend with yt-dlp integration
 ├── public/
 │   └── index.html      # Frontend UI (single-file, no build step required)
@@ -210,7 +273,7 @@ tubegrab/
 
 ## Production Notes
 
-- **Rate limiting**: Add `express-rate-limit` before exposing publicly to prevent abuse
+- **Rate limiting**: Tune `GLOBAL_RATE_LIMIT_MAX`, `DOWNLOAD_RATE_LIMIT_MAX`, and `DOWNLOAD_START_RATE_LIMIT_MAX` for your traffic profile
 - **Reverse proxy**: Use nginx or Caddy in front for SSL/TLS termination
 - **Resources**: Each download is CPU and I/O intensive; size your server accordingly
 - **yt-dlp updates**: YouTube changes frequently break older versions; keep yt-dlp up to date with `pip install -U yt-dlp`

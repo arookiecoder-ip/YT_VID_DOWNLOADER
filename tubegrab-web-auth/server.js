@@ -10,6 +10,13 @@ const fs = require("fs");
 require("dotenv").config();
 
 const app = express();
+
+function parsePositiveEnvInt(value, fallback) {
+  const parsed = Number.parseInt(String(value || "").trim(), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const NODE_ENV = process.env.NODE_ENV || "development";
 const PORT = process.env.PORT || 3000;
 const YT_DLP = process.env.YT_DLP_PATH || "yt-dlp";
 const YTDLP_COOKIES = process.env.YTDLP_COOKIES || "";
@@ -17,33 +24,59 @@ const AUTH_USERNAME = process.env.AUTH_USERNAME || "admin";
 const AUTH_PASSWORD = process.env.AUTH_PASSWORD || "change-me-now";
 const AUTH_REALM = process.env.AUTH_REALM || "TubeGrab Protected";
 const TRUST_PROXY = process.env.TRUST_PROXY || "";
-const AUTH_MAX_FAILURES = Number.parseInt(
-  process.env.AUTH_MAX_FAILURES || "10",
-  10,
+const AUTH_MAX_FAILURES = parsePositiveEnvInt(process.env.AUTH_MAX_FAILURES, 10);
+const AUTH_BLOCK_MINUTES = parsePositiveEnvInt(process.env.AUTH_BLOCK_MINUTES, 15);
+const GLOBAL_RATE_LIMIT_WINDOW_MS = parsePositiveEnvInt(
+  process.env.GLOBAL_RATE_LIMIT_WINDOW_MS,
+  60000,
 );
-const AUTH_BLOCK_MINUTES = Number.parseInt(
-  process.env.AUTH_BLOCK_MINUTES || "15",
-  10,
+const GLOBAL_RATE_LIMIT_MAX = parsePositiveEnvInt(
+  process.env.GLOBAL_RATE_LIMIT_MAX,
+  120,
 );
-const GLOBAL_RATE_LIMIT_WINDOW_MS = Number.parseInt(
-  process.env.GLOBAL_RATE_LIMIT_WINDOW_MS || "60000",
-  10,
+const DOWNLOAD_RATE_LIMIT_MAX = parsePositiveEnvInt(
+  process.env.DOWNLOAD_RATE_LIMIT_MAX,
+  8,
 );
-const GLOBAL_RATE_LIMIT_MAX = Number.parseInt(
-  process.env.GLOBAL_RATE_LIMIT_MAX || "120",
-  10,
+const DOWNLOAD_START_RATE_LIMIT_MAX = parsePositiveEnvInt(
+  process.env.DOWNLOAD_START_RATE_LIMIT_MAX,
+  60,
 );
-const DOWNLOAD_RATE_LIMIT_MAX = Number.parseInt(
-  process.env.DOWNLOAD_RATE_LIMIT_MAX || "8",
-  10,
-);
+const MAX_PLAYLIST_ENTRIES = parsePositiveEnvInt(process.env.MAX_PLAYLIST_ENTRIES, 50);
+const MAX_CONCURRENT_JOBS = parsePositiveEnvInt(process.env.MAX_CONCURRENT_JOBS, 25);
+const MAX_INPUT_URL_LENGTH = 2048;
+const DEBUG_API_ERRORS =
+  String(process.env.DEBUG_API_ERRORS || "").trim().toLowerCase() === "1" ||
+  String(process.env.DEBUG_API_ERRORS || "").trim().toLowerCase() === "true";
+const DOWNLOAD_WATCHDOG_MS = 180000;
+const DOWNLOAD_WATCHDOG_TICK_MS = 15000;
+const IFRAME_LIFETIME_MS = 120000;
+const JOB_TTL_MS = 30 * 60 * 1000;
+const JOB_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
+const PROGRESS_RANGE = 70;
 const authFailuresByIp = new Map();
 
 if (TRUST_PROXY) {
-  app.set("trust proxy", TRUST_PROXY === "true" ? 1 : TRUST_PROXY);
+  const normalizedTrustProxy = String(TRUST_PROXY).trim().toLowerCase();
+  if (normalizedTrustProxy === "true" || normalizedTrustProxy === "1") {
+    app.set("trust proxy", 1);
+  } else if (normalizedTrustProxy === "false" || normalizedTrustProxy === "0") {
+    app.set("trust proxy", false);
+  } else {
+    app.set("trust proxy", TRUST_PROXY);
+  }
 }
 
-if (AUTH_USERNAME === "admin" && AUTH_PASSWORD === "change-me-now") {
+if (NODE_ENV === "production") {
+  if (!process.env.AUTH_USERNAME || !process.env.AUTH_PASSWORD) {
+    throw new Error(
+      "[auth] AUTH_USERNAME and AUTH_PASSWORD must be explicitly set in production.",
+    );
+  }
+  if (AUTH_USERNAME === "admin" && AUTH_PASSWORD === "change-me-now") {
+    throw new Error("[auth] Default credentials are not allowed in production.");
+  }
+} else if (AUTH_USERNAME === "admin" && AUTH_PASSWORD === "change-me-now") {
   console.warn(
     "[auth] Using default credentials. Set AUTH_USERNAME and AUTH_PASSWORD for production.",
   );
@@ -62,11 +95,8 @@ function sendAuthChallenge(res) {
 }
 
 function getClientId(req) {
-  const xff = String(req.headers["x-forwarded-for"] || "")
-    .split(",")
-    .map((part) => part.trim())
-    .find(Boolean);
-  return xff || req.ip || req.socket.remoteAddress || "unknown";
+  const candidate = req.ip || req.socket?.remoteAddress || "";
+  return String(candidate).trim() || "unknown";
 }
 
 function getBlockedUntil(clientId) {
@@ -108,7 +138,7 @@ function clearAuthFailures(clientId) {
   authFailuresByIp.delete(clientId);
 }
 
-setInterval(
+const authFailureSweepTimer = setInterval(
   () => {
     const now = Date.now();
     for (const [ip, state] of authFailuresByIp.entries()) {
@@ -120,6 +150,9 @@ setInterval(
   },
   10 * 60 * 1000,
 );
+if (typeof authFailureSweepTimer.unref === "function") {
+  authFailureSweepTimer.unref();
+}
 
 const globalLimiter = rateLimit({
   windowMs: GLOBAL_RATE_LIMIT_WINDOW_MS,
@@ -129,12 +162,20 @@ const globalLimiter = rateLimit({
   message: { error: "Too many requests. Try again shortly." },
 });
 
-const downloadLimiter = rateLimit({
+const directDownloadLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: DOWNLOAD_RATE_LIMIT_MAX,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many download requests. Wait and retry." },
+});
+
+const downloadStartLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: DOWNLOAD_START_RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many queued jobs. Wait and retry." },
 });
 
 function basicAuthMiddleware(req, res, next) {
@@ -186,7 +227,32 @@ function basicAuthMiddleware(req, res, next) {
 
 app.use(
   helmet({
-    contentSecurityPolicy: false,
+    contentSecurityPolicy: {
+      useDefaults: true,
+      directives: {
+        "default-src": ["'self'"],
+        "img-src": [
+          "'self'",
+          "data:",
+          "https://i.ytimg.com",
+          "https://img.youtube.com",
+          "https://yt3.ggpht.com",
+        ],
+        "script-src": ["'self'", "'unsafe-inline'"],
+        "script-src-attr": ["'unsafe-inline'"],
+        "style-src": [
+          "'self'",
+          "'unsafe-inline'",
+          "https://fonts.googleapis.com",
+        ],
+        "font-src": ["'self'", "data:", "https://fonts.gstatic.com"],
+        "connect-src": ["'self'"],
+        "frame-src": ["'self'"],
+        "object-src": ["'none'"],
+        "base-uri": ["'self'"],
+        "form-action": ["'self'"],
+      },
+    },
     crossOriginResourcePolicy: { policy: "cross-origin" },
   }),
 );
@@ -196,28 +262,85 @@ app.use(express.json({ limit: "32kb" }));
 app.use(basicAuthMiddleware);
 app.use(express.static(path.join(__dirname, "public")));
 
+const YOUTUBE_HOSTS = new Set([
+  "youtube.com",
+  "www.youtube.com",
+  "m.youtube.com",
+  "music.youtube.com",
+  "youtu.be",
+]);
+const VIDEO_ID_RE = /^[\w-]{11}$/;
+const LIST_ID_RE = /^[\w-]{1,64}$/;
+
+function parseYouTubeURL(raw) {
+  let parsed;
+  try {
+    parsed = new URL(String(raw || "").trim());
+  } catch {
+    try {
+      parsed = new URL("https://" + String(raw || "").trim());
+    } catch {
+      return null;
+    }
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") return null;
+  if (!YOUTUBE_HOSTS.has(parsed.hostname.toLowerCase())) return null;
+
+  const host = parsed.hostname.toLowerCase();
+  const path = parsed.pathname;
+  const videoId = parsed.searchParams.get("v");
+  const listId = parsed.searchParams.get("list");
+  const shortMatch = path.match(/^\/(shorts|live|embed)\/([\w-]{11})/);
+  const shortId = host === "youtu.be" ? path.slice(1).split("/")[0] : null;
+
+  const hasValidVideo =
+    (videoId && VIDEO_ID_RE.test(videoId)) ||
+    (shortMatch && VIDEO_ID_RE.test(shortMatch[2])) ||
+    (shortId && VIDEO_ID_RE.test(shortId));
+  const hasValidList =
+    (path === "/playlist" || path.startsWith("/playlist")) &&
+    listId &&
+    LIST_ID_RE.test(listId);
+  const hasValidWatchList =
+    path === "/watch" && listId && LIST_ID_RE.test(listId);
+
+  if (!hasValidVideo && !hasValidList && !hasValidWatchList) return null;
+
+  return {
+    host,
+    path,
+    videoId:
+      (videoId && VIDEO_ID_RE.test(videoId) && videoId) ||
+      (shortMatch && shortMatch[2]) ||
+      (shortId && VIDEO_ID_RE.test(shortId) && shortId) ||
+      null,
+    listId: listId && LIST_ID_RE.test(listId) ? listId : null,
+    isPlaylistPath: path.startsWith("/playlist"),
+  };
+}
+
 function isValidYouTubeURL(url) {
-  return [
-    /^(https?:\/\/)?(www\.)?youtube\.com\/watch\?.*v=[\w-]{11}/,
-    /^(https?:\/\/)?(www\.)?youtube\.com\/shorts\/[\w-]{11}/,
-    /^(https?:\/\/)?(www\.)?youtube\.com\/live\/[\w-]{11}/,
-    /^(https?:\/\/)?youtu\.be\/[\w-]{11}/,
-    /^(https?:\/\/)?(www\.)?youtube\.com\/embed\/[\w-]{11}/,
-    /^(https?:\/\/)?(www\.)?youtube\.com\/playlist\?.*list=[\w-]+/,
-    /^(https?:\/\/)?(www\.)?youtube\.com\/watch\?.*list=[\w-]+/,
-  ].some((pattern) => pattern.test(url));
+  return parseYouTubeURL(url) !== null;
 }
 
 function isPlaylistURL(url) {
-  return /[?&]list=[\w-]+/.test(String(url || ""));
+  const info = parseYouTubeURL(url);
+  if (!info) return false;
+  if (info.isPlaylistPath && info.listId) return true;
+  return Boolean(info.listId) && !info.videoId;
+}
+
+function normalizeRequestUrl(raw) {
+  const normalized = String(raw || "").trim();
+  if (!normalized || normalized.length > MAX_INPUT_URL_LENGTH) return null;
+  return normalized;
 }
 
 function withCookies(args) {
-  const base = ["--js-runtimes", "node", ...args];
   if (YTDLP_COOKIES && fs.existsSync(YTDLP_COOKIES)) {
-    return ["--cookies", YTDLP_COOKIES, ...base];
+    return ["--cookies", YTDLP_COOKIES, ...args];
   }
-  return base;
+  return args;
 }
 
 function runYtDlp(args) {
@@ -233,6 +356,29 @@ function runYtDlp(args) {
           );
         }
         resolve(stdout.trim());
+      },
+    );
+  });
+}
+
+function checkBinary(binary, args = ["--version"]) {
+  return new Promise((resolve) => {
+    execFile(
+      binary,
+      args,
+      { timeout: 15000, maxBuffer: 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (err) {
+          return resolve({
+            ok: false,
+            error: (stderr || err.message || "check failed").trim().slice(0, 300),
+          });
+        }
+        const firstLine = String(stdout || stderr || "")
+          .split(/\r?\n/)
+          .map((part) => part.trim())
+          .find(Boolean);
+        resolve({ ok: true, version: firstLine || "unknown" });
       },
     );
   });
@@ -347,7 +493,7 @@ function parseFormats(rawFormats) {
   videoFormats.sort((a, b) => b.height - a.height);
 
   return [
-    ...videoFormats.slice(0, 5),
+    ...videoFormats,
     {
       id: "bestaudio",
       label: "MP3",
@@ -450,13 +596,19 @@ function sanitizeFilename(name) {
   return (
     String(name || "video")
       .replace(/[\\/:*?"<>|]/g, "")
-      // Strip non-ASCII characters (emojis, fancy Unicode) — they break HTTP headers
-      // The filename*= RFC 5987 encoded version handles Unicode for modern browsers
       // eslint-disable-next-line no-control-regex
-      .replace(/[^\x00-\x7F]/g, "")
+      .replace(/[\x00-\x1F\x7F]/g, "")
       .replace(/\s+/g, " ")
       .trim()
       .slice(0, 120) || "video"
+  );
+}
+
+function asciiFallbackFilename(name) {
+  return (
+    // eslint-disable-next-line no-control-regex
+    String(name || "video").replace(/[^\x20-\x7E]/g, "_").replace(/"/g, "") ||
+    "video"
   );
 }
 
@@ -575,8 +727,9 @@ function buildDownloadArgs(formatId, isAudio, outputTarget = "-") {
 
 // GET /api/info
 app.get("/api/info", async (req, res) => {
-  const url = String(req.query.url || "").trim();
-  if (!url || !isValidYouTubeURL(url)) {
+  const url = normalizeRequestUrl(req.query.url);
+  const parsed = parseYouTubeURL(url);
+  if (!parsed) {
     return res.status(400).json({ error: "Invalid or missing YouTube URL" });
   }
 
@@ -587,10 +740,15 @@ app.get("/api/info", async (req, res) => {
         "--flat-playlist",
         "--no-warnings",
         "--yes-playlist",
+        "--playlist-end",
+        String(MAX_PLAYLIST_ENTRIES),
         url,
       ]);
       const playlist = JSON.parse(rawPlaylist);
-      const entries = normalizePlaylistEntries(playlist.entries || []);
+      const entries = normalizePlaylistEntries(playlist.entries || []).slice(
+        0,
+        MAX_PLAYLIST_ENTRIES,
+      );
 
       if (!entries.length) {
         return res.status(400).json({
@@ -652,15 +810,19 @@ app.get("/api/info", async (req, res) => {
     });
   } catch (err) {
     console.error("[/api/info]", err.message);
-    res.status(500).json({
-      error: "Failed to fetch video info. It may be restricted or unavailable.",
-    });
+    const generic = "Failed to fetch video info. It may be restricted or unavailable.";
+    if (DEBUG_API_ERRORS) {
+      return res.status(500).json({
+        error: generic + " Details: " + String(err.message || "unknown").slice(0, 220),
+      });
+    }
+    res.status(500).json({ error: generic });
   }
 });
 
 // GET /api/download-meta
 app.get("/api/download-meta", async (req, res) => {
-  const url = String(req.query.url || "").trim();
+  const url = normalizeRequestUrl(req.query.url);
   const formatId = String(req.query.formatId || "best").trim();
   const ext = String(req.query.ext || "mp4")
     .trim()
@@ -684,8 +846,15 @@ app.get("/api/download-meta", async (req, res) => {
 // ── Job store ────────────────────────────────────────────────────────────────
 // Keyed by token (random hex). States: pending → done | error.
 // Files are cleaned up after JOB_TTL_MS or on first file request.
-const JOB_TTL_MS = 30 * 60 * 1000; // 30 minutes
 const jobs = new Map();
+
+function countActiveJobs() {
+  let active = 0;
+  for (const job of jobs.values()) {
+    if (job.state === "pending") active += 1;
+  }
+  return active;
+}
 
 function createJob(token, meta) {
   jobs.set(token, {
@@ -715,144 +884,222 @@ function cleanupJob(token) {
   jobs.delete(token);
 }
 
-// Sweep expired jobs every 10 minutes.
-setInterval(() => {
+// Sweep expired jobs.
+const jobSweepTimer = setInterval(() => {
   const now = Date.now();
   for (const [token, job] of jobs.entries()) {
     if (now - job.createdAt > JOB_TTL_MS) cleanupJob(token);
   }
-}, 10 * 60 * 1000);
+}, JOB_SWEEP_INTERVAL_MS);
+if (typeof jobSweepTimer.unref === "function") {
+  jobSweepTimer.unref();
+}
+
+function performDownload(url, formatId, isAudio, { onProgress, onStage } = {}) {
+  const outputExt = isAudio ? "mp3" : "mp4";
+  const selector = getFormatSelector(formatId, isAudio);
+  const needsMerge = !isAudio && selector.includes("+");
+  let tempPath = createTempDownloadPath(outputExt);
+
+  return new Promise((resolve, reject) => {
+    const ytdlpArgs = withCookies(
+      buildDownloadArgs(formatId, isAudio, tempPath),
+    );
+    ytdlpArgs.push(url);
+
+    const proc = spawn(YT_DLP, ytdlpArgs, {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let stderr = "";
+    let streamIndex = 0;
+    const expectedStreams = isAudio ? 1 : needsMerge ? 2 : 1;
+    let lastActivityAt = Date.now();
+
+    const handleOutput = (text, isErr) => {
+      lastActivityAt = Date.now();
+      if (text.match(/\[download\]\s+Destination:/g)) {
+        streamIndex += text.match(/\[download\]\s+Destination:/g).length;
+      }
+      if (onProgress) {
+        const progressMatches = [
+          ...text.matchAll(/\[download\]\s+(\d+(?:\.\d+)?)%/g),
+        ];
+        if (progressMatches.length) {
+          const latest = parseFloat(
+            progressMatches[progressMatches.length - 1][1],
+          );
+          const streams = Math.max(expectedStreams, streamIndex);
+          const currentStream = Math.max(1, streamIndex);
+          const perStream = PROGRESS_RANGE / streams;
+          const base = 5 + (currentStream - 1) * perStream;
+          const pct = Math.min(
+            75,
+            Math.round(base + (latest / 100) * perStream),
+          );
+          onProgress(pct);
+        }
+      }
+      if (
+        onStage &&
+        /\[Merger\]|\[ExtractAudio\]|Deleting original|post-process/i.test(text)
+      ) {
+        onStage("Merging…");
+      }
+      if (isErr) stderr += text;
+      const line = text.trim();
+      if (line) console.log("[yt-dlp]", line);
+    };
+
+    proc.stdout.on("data", (chunk) => handleOutput(chunk.toString(), false));
+    proc.stderr.on("data", (chunk) => handleOutput(chunk.toString(), true));
+
+    const watchdog = setInterval(() => {
+      if (Date.now() - lastActivityAt > DOWNLOAD_WATCHDOG_MS) {
+        try {
+          proc.kill("SIGKILL");
+        } catch {}
+      }
+    }, DOWNLOAD_WATCHDOG_TICK_MS);
+
+    proc.on("close", async (code) => {
+      clearInterval(watchdog);
+      if (code !== 0) {
+        removeFileQuietly(tempPath);
+        return reject(
+          new Error(
+            stderr.trim().slice(-300) || "yt-dlp exited with code " + code,
+          ),
+        );
+      }
+      if (!fs.existsSync(tempPath)) {
+        return reject(new Error("Downloaded file was not generated."));
+      }
+
+      // Only remux when we actually merged video + audio — saves one ffmpeg
+      // pass for progressive MP4 selections.
+      if (!isAudio && needsMerge) {
+        if (onStage) onStage("Processing…");
+        try {
+          const remuxed = await remuxMp4(tempPath);
+          removeFileQuietly(tempPath);
+          tempPath = remuxed;
+        } catch (err) {
+          removeFileQuietly(tempPath);
+          return reject(err);
+        }
+      }
+
+      resolve({ path: tempPath, ext: outputExt });
+    });
+
+    proc.on("error", (err) => {
+      clearInterval(watchdog);
+      removeFileQuietly(tempPath);
+      reject(err);
+    });
+  });
+}
+
+function remuxMp4(inputPath) {
+  return new Promise((resolve, reject) => {
+    const outputPath = createTempDownloadPath("mp4");
+    const proc = spawn(
+      "ffmpeg",
+      [
+        "-i",
+        inputPath,
+        "-c",
+        "copy",
+        "-movflags",
+        "+faststart",
+        "-y",
+        outputPath,
+      ],
+      { stdio: ["ignore", "ignore", "pipe"] },
+    );
+    let stderr = "";
+    proc.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    proc.on("close", (code) => {
+      if (code === 0) return resolve(outputPath);
+      removeFileQuietly(outputPath);
+      reject(new Error("ffmpeg remux failed: " + stderr.slice(-300)));
+    });
+    proc.on("error", reject);
+  });
+}
+
+async function fetchVideoTitle(url) {
+  try {
+    return await runYtDlp([
+      "--get-title",
+      "--no-warnings",
+      "--no-playlist",
+      url,
+    ]);
+  } catch {
+    return "video";
+  }
+}
+
+function buildContentDisposition(filename) {
+  const ascii = asciiFallbackFilename(filename);
+  const encoded = encodeURIComponent(filename);
+  return 'attachment; filename="' + ascii + "\"; filename*=UTF-8''" + encoded;
+}
 
 async function runDownloadJob(token, url, formatId, isAudio) {
-  const outputExt = isAudio ? "mp3" : "mp4";
-  let tempPath = null;
-
+  let producedPath = null;
   try {
     updateJob(token, { stage: "Downloading…", progress: 5 });
 
-    tempPath = createTempDownloadPath(outputExt);
-    const ytdlpArgs = withCookies(buildDownloadArgs(formatId, isAudio, tempPath));
-    ytdlpArgs.push(url);
-
-    const [titleRaw] = await Promise.all([
-      runYtDlp(["--get-title", "--no-warnings", "--no-playlist", url]).catch(() => "video"),
-      new Promise((resolve, reject) => {
-        const proc = spawn(YT_DLP, ytdlpArgs, { stdio: ["ignore", "pipe", "pipe"] });
-        let stderr = "";
-        let lastProgress = 5;
-        let lastActivityAt = Date.now();
-        // When merging video+audio, yt-dlp runs TWO downloads back-to-back,
-        // each going 0→100%. streamIndex tracks which one we're on so progress
-        // doesn't freeze when the second stream restarts at 0%.
-        let streamIndex = 0;
-        let expectedStreams = isAudio ? 1 : 2;
-
-        const handleOutput = (text, isErr) => {
-          lastActivityAt = Date.now();
-          // "[download] Destination:" marks the start of each stream.
-          const destMatches = text.match(/\[download\]\s+Destination:/g);
-          if (destMatches) streamIndex += destMatches.length;
-
-          // yt-dlp emits progress to STDOUT (e.g. "[download]  42.3% of ...").
-          // We MUST drain stdout as well or the pipe buffer fills and yt-dlp blocks.
-          const progressMatches = [...text.matchAll(/\[download\]\s+(\d+(?:\.\d+)?)%/g)];
-          if (progressMatches.length) {
-            const latest = parseFloat(progressMatches[progressMatches.length - 1][1]);
-            // Spread 5→75 across expectedStreams. If we see more streams than
-            // expected, keep extending rather than pegging at max.
-            const streams = Math.max(expectedStreams, streamIndex);
-            const currentStream = Math.max(1, streamIndex);
-            const perStream = 70 / streams;
-            const base = 5 + (currentStream - 1) * perStream;
-            const pct = Math.min(75, Math.round(base + (latest / 100) * perStream));
-            if (pct > lastProgress) {
-              lastProgress = pct;
-              updateJob(token, { progress: pct, stage: "Downloading…" });
-            }
-          }
-          if (/\[Merger\]|\[ExtractAudio\]|Deleting original|post-process/i.test(text)) {
-            updateJob(token, { stage: "Merging…", progress: Math.max(lastProgress, 78) });
-          }
-          if (isErr) stderr += text;
-          const line = text.trim();
-          if (line) console.error("[job:" + token.slice(0, 6) + "]", line);
-        };
-
-        proc.stdout.on("data", (chunk) => handleOutput(chunk.toString(), false));
-        proc.stderr.on("data", (chunk) => handleOutput(chunk.toString(), true));
-
-        // Watchdog: if no progress activity for 3 minutes, kill the process.
-        // (Slow merges on long videos can take >2min between log lines.)
-        const watchdog = setInterval(() => {
-          if (Date.now() - lastActivityAt > 180000) {
-            try { proc.kill("SIGKILL"); } catch {}
-          }
-        }, 15000);
-
-        proc.on("close", (code) => {
-          clearInterval(watchdog);
-          if (code === 0) { resolve(); return; }
-          removeFileQuietly(tempPath);
-          reject(new Error(stderr.trim().slice(-300) || "yt-dlp exited with code " + code));
+    let lastProgress = 5;
+    const result = await performDownload(url, formatId, isAudio, {
+      onProgress: (pct) => {
+        if (pct > lastProgress) {
+          lastProgress = pct;
+          updateJob(token, { progress: pct, stage: "Downloading…" });
+        }
+      },
+      onStage: (stage) => {
+        updateJob(token, {
+          stage,
+          progress: Math.max(lastProgress, 78),
         });
-        proc.on("error", (err) => {
-          clearInterval(watchdog);
-          removeFileQuietly(tempPath);
-          reject(err);
-        });
-      }),
-    ]);
+      },
+    });
+    producedPath = result.path;
 
-    if (!fs.existsSync(tempPath)) throw new Error("Downloaded file was not generated.");
-
-    if (!isAudio) {
-      updateJob(token, { stage: "Processing…", progress: 83 });
-      const remuxedPath = createTempDownloadPath("mp4");
-      await new Promise((resolve, reject) => {
-        const proc = spawn("ffmpeg", [
-          "-i", tempPath, "-c", "copy", "-movflags", "+faststart", "-y", remuxedPath,
-        ], { stdio: ["ignore", "ignore", "pipe"] });
-        let stderr = "";
-        proc.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-        proc.on("close", (code) => {
-          removeFileQuietly(tempPath);
-          tempPath = null;
-          if (code === 0) { resolve(); return; }
-          removeFileQuietly(remuxedPath);
-          reject(new Error("ffmpeg remux failed: " + stderr.slice(-300)));
-        });
-        proc.on("error", reject);
-      });
-      tempPath = remuxedPath;
-    }
-
-    if (!fs.existsSync(tempPath)) throw new Error("Output file was not generated.");
-
-    const safeTitle = sanitizeFilename(titleRaw);
-    const filename = safeTitle + "." + outputExt;
-    const stat = fs.statSync(tempPath);
+    const titleRaw = await fetchVideoTitle(url);
+    const filename = sanitizeFilename(titleRaw) + "." + result.ext;
+    const stat = fs.statSync(producedPath);
 
     updateJob(token, {
       state: "done",
       progress: 100,
       stage: "Ready",
       filename,
-      filePath: tempPath,
+      filePath: producedPath,
       contentType: isAudio ? "audio/mpeg" : "video/mp4",
       fileSize: stat.size,
     });
     console.log("[job:" + token.slice(0, 6) + "] done →", filename);
   } catch (err) {
     console.error("[job:" + token.slice(0, 6) + "] error:", err.message);
-    removeFileQuietly(tempPath);
-    updateJob(token, { state: "error", stage: "Failed", error: err.message.slice(0, 300) });
+    removeFileQuietly(producedPath);
+    updateJob(token, {
+      state: "error",
+      stage: "Failed",
+      error: err.message.slice(0, 300),
+    });
   }
 }
 
 // POST /api/download/start — kick off background job, return token immediately
-app.post("/api/download/start", downloadLimiter, (req, res) => {
+app.post("/api/download/start", downloadStartLimiter, (req, res) => {
   const source = req.body || {};
-  const url = String(source.url || "").trim();
+  const url = normalizeRequestUrl(source.url);
   const formatId = String(source.formatId || "best").trim();
   const ext = String(source.ext || "mp4").trim().toLowerCase();
 
@@ -860,11 +1107,18 @@ app.post("/api/download/start", downloadLimiter, (req, res) => {
     return res.status(400).json({ error: "Invalid or missing YouTube URL" });
   }
 
+  if (countActiveJobs() >= MAX_CONCURRENT_JOBS) {
+    res.set("Retry-After", "60");
+    return res
+      .status(429)
+      .json({ error: "Server is busy. Please try again in a minute." });
+  }
+
   const isAudio = ext === "mp3" || formatId === "bestaudio";
   const token = crypto.randomBytes(16).toString("hex");
+  const clientId = getClientId(req);
 
-  createJob(token, { url, formatId, isAudio });
-  // Fire and forget — response returns before the download starts
+  createJob(token, { url, formatId, isAudio, clientId });
   runDownloadJob(token, url, formatId, isAudio);
 
   res.json({ token });
@@ -875,6 +1129,9 @@ app.get("/api/download/status/:token", (req, res) => {
   const token = String(req.params.token || "").trim();
   const job = jobs.get(token);
   if (!job) return res.status(404).json({ error: "Job not found or expired" });
+  if (job.clientId && job.clientId !== getClientId(req)) {
+    return res.status(404).json({ error: "Job not found or expired" });
+  }
 
   res.json({
     state: job.state,
@@ -892,6 +1149,9 @@ app.get("/api/download/file/:token", (req, res) => {
   const job = jobs.get(token);
 
   if (!job) return res.status(404).json({ error: "Job not found or expired" });
+  if (job.clientId && job.clientId !== getClientId(req)) {
+    return res.status(404).json({ error: "Job not found or expired" });
+  }
   if (job.state === "pending") return res.status(202).json({ error: "Download not ready yet" });
   if (job.state === "error") return res.status(500).json({ error: job.error || "Download failed" });
   if (!job.filePath || !fs.existsSync(job.filePath)) {
@@ -899,11 +1159,9 @@ app.get("/api/download/file/:token", (req, res) => {
     return res.status(410).json({ error: "File has already been served or was cleaned up" });
   }
 
-  const encodedFilename = encodeURIComponent(job.filename);
   res.set({
     "Content-Type": job.contentType,
-    "Content-Disposition":
-      'attachment; filename="' + job.filename + "\"; filename*=UTF-8''" + encodedFilename,
+    "Content-Disposition": buildContentDisposition(job.filename),
     "Cache-Control": "no-store",
     "Content-Length": String(job.fileSize),
   });
@@ -922,7 +1180,7 @@ app.get("/api/download/file/:token", (req, res) => {
 async function streamDownload(req, res) {
   const source =
     req.method === "GET" || req.method === "HEAD" ? req.query : req.body || {};
-  const url = String(source.url || "").trim();
+  const url = normalizeRequestUrl(source.url);
   const formatId = String(source.formatId || "best").trim();
   const ext = String(source.ext || "mp4").trim().toLowerCase();
 
@@ -931,82 +1189,37 @@ async function streamDownload(req, res) {
   }
 
   const isAudio = ext === "mp3" || formatId === "bestaudio";
-  const outputExt = isAudio ? "mp3" : "mp4";
   const contentType = isAudio ? "audio/mpeg" : "video/mp4";
-  let tempPath = null;
+  let producedPath = null;
 
   try {
-    tempPath = createTempDownloadPath(outputExt);
-    const ytdlpArgs = withCookies(buildDownloadArgs(formatId, isAudio, tempPath));
-    ytdlpArgs.push(url);
+    const result = await performDownload(url, formatId, isAudio);
+    producedPath = result.path;
 
-    const [titleRaw] = await Promise.all([
-      runYtDlp(["--get-title", "--no-warnings", "--no-playlist", url]).catch(() => "video"),
-      new Promise((resolve, reject) => {
-        const proc = spawn(YT_DLP, ytdlpArgs, { stdio: ["ignore", "pipe", "pipe"] });
-        let stderr = "";
-        // Drain stdout as well — yt-dlp writes progress there and will block if
-        // the pipe buffer fills.
-        proc.stdout.on("data", (chunk) => {
-          const line = chunk.toString().trim();
-          if (line) console.error("[/api/download]", line);
-        });
-        proc.stderr.on("data", (chunk) => {
-          stderr += chunk.toString();
-          const line = chunk.toString().trim();
-          if (line) console.error("[/api/download]", line);
-        });
-        proc.on("close", (code) => {
-          if (code === 0) { resolve(); return; }
-          removeFileQuietly(tempPath);
-          reject(new Error(stderr.trim().slice(-300) || "yt-dlp exited with code " + code));
-        });
-        proc.on("error", (err) => { removeFileQuietly(tempPath); reject(err); });
-      }),
-    ]);
-
-    if (!fs.existsSync(tempPath)) throw new Error("Downloaded file was not generated.");
-
-    if (!isAudio) {
-      const remuxedPath = createTempDownloadPath("mp4");
-      await new Promise((resolve, reject) => {
-        const proc = spawn("ffmpeg", [
-          "-i", tempPath, "-c", "copy", "-movflags", "+faststart", "-y", remuxedPath,
-        ], { stdio: ["ignore", "ignore", "pipe"] });
-        let stderr = "";
-        proc.stderr.on("data", (chunk) => { stderr += chunk.toString(); });
-        proc.on("close", (code) => {
-          removeFileQuietly(tempPath);
-          if (code === 0) { resolve(); return; }
-          removeFileQuietly(remuxedPath);
-          reject(new Error("ffmpeg remux failed: " + stderr.slice(-300)));
-        });
-        proc.on("error", reject);
-      });
-      tempPath = remuxedPath;
-    }
-
-    if (!fs.existsSync(tempPath)) throw new Error("Output file was not generated.");
-
-    const safeTitle = sanitizeFilename(titleRaw);
-    const filename = safeTitle + "." + outputExt;
-    const encodedFilename = encodeURIComponent(filename);
-    const stat = fs.statSync(tempPath);
+    const titleRaw = await fetchVideoTitle(url);
+    const filename = sanitizeFilename(titleRaw) + "." + result.ext;
+    const stat = fs.statSync(producedPath);
 
     res.set({
       "Content-Type": contentType,
-      "Content-Disposition":
-        'attachment; filename="' + filename + "\"; filename*=UTF-8''" + encodedFilename,
+      "Content-Disposition": buildContentDisposition(filename),
       "Cache-Control": "no-store",
       "Content-Length": String(stat.size),
     });
 
     let cleaned = false;
-    const cleanup = () => { if (cleaned) return; cleaned = true; removeFileQuietly(tempPath); };
-    const fileStream = fs.createReadStream(tempPath);
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      removeFileQuietly(producedPath);
+    };
+    const fileStream = fs.createReadStream(producedPath);
     fileStream.on("error", (err) => {
       cleanup();
-      if (!res.headersSent) res.status(500).json({ error: "Download failed: " + err.message.slice(0, 200) });
+      if (!res.headersSent)
+        res
+          .status(500)
+          .json({ error: "Download failed: " + err.message.slice(0, 200) });
       else res.destroy(err);
     });
     fileStream.on("close", cleanup);
@@ -1014,19 +1227,22 @@ async function streamDownload(req, res) {
     fileStream.pipe(res);
   } catch (err) {
     console.error("[/api/download]", err.message);
-    removeFileQuietly(tempPath);
-    if (!res.headersSent) res.status(500).json({ error: "Download failed: " + err.message.slice(0, 200) });
+    removeFileQuietly(producedPath);
+    if (!res.headersSent)
+      res
+        .status(500)
+        .json({ error: "Download failed: " + err.message.slice(0, 200) });
   }
 }
 
 // GET /api/download — legacy direct stream (used by playlist iframe fallback)
-app.use("/api/download", downloadLimiter);
+app.use("/api/download", directDownloadLimiter);
 app.get("/api/download", streamDownload);
 app.post("/api/download", streamDownload);
 
 // GET /api/formats
 app.get("/api/formats", async (req, res) => {
-  const { url } = req.query;
+  const url = normalizeRequestUrl(req.query.url);
   if (!url || !isValidYouTubeURL(url)) {
     return res.status(400).json({ error: "Invalid YouTube URL" });
   }
@@ -1045,10 +1261,18 @@ app.get("/api/formats", async (req, res) => {
 });
 
 // Health check
-app.get("/api/health", (req, res) => {
-  res.json({
-    status: "ok",
-    ytdlp: YT_DLP,
+app.get("/api/health", async (req, res) => {
+  const [ytDlpCheck, ffmpegCheck] = await Promise.all([
+    checkBinary(YT_DLP, ["--version"]),
+    checkBinary("ffmpeg", ["-version"]),
+  ]);
+
+  const healthy = ytDlpCheck.ok && ffmpegCheck.ok;
+  res.status(healthy ? 200 : 503).json({
+    status: healthy ? "ok" : "degraded",
+    ytdlpPath: YT_DLP,
+    ytdlp: ytDlpCheck,
+    ffmpeg: ffmpegCheck,
     timestamp: new Date().toISOString(),
   });
 });
@@ -1075,6 +1299,23 @@ app.get("/{*splat}", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
-app.listen(PORT, () => {
-  console.log("\n  TubeGrab running at http://localhost:" + PORT + "\n");
-});
+function startServer(port = PORT) {
+  return app.listen(port, () => {
+    console.log("\n  TubeGrab running at http://localhost:" + port + "\n");
+  });
+}
+
+if (require.main === module) {
+  startServer();
+}
+
+module.exports = {
+  app,
+  startServer,
+  parsePositiveEnvInt,
+  parseYouTubeURL,
+  isPlaylistURL,
+  normalizeRequestUrl,
+  getClientId,
+  MAX_INPUT_URL_LENGTH,
+};

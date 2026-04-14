@@ -9,13 +9,14 @@ services:
     environment:
       - NODE_ENV=production
       - PORT=3000
-      - AUTH_USERNAME=${AUTH_USERNAME:-admin}
-      - AUTH_PASSWORD=${AUTH_PASSWORD:-change-me-now}
+      - AUTH_USERNAME=${AUTH_USERNAME:?AUTH_USERNAME is required}
+      - AUTH_PASSWORD=${AUTH_PASSWORD:?AUTH_PASSWORD is required}
       - AUTH_REALM=${AUTH_REALM:-TubeGrab Protected}
+      - DOWNLOAD_START_RATE_LIMIT_MAX=${DOWNLOAD_START_RATE_LIMIT_MAX:-60}
       - YTDLP_COOKIES=/app/cookies.txt
     volumes:
       - downloads:/app/downloads
-      - ./cookies.txt:/app/cookies.txt
+      - ./cookies.txt:/app/cookies.txt:ro
     restart: unless-stopped
     mem_limit: 1g
 

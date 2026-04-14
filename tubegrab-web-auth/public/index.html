@@ -223,6 +223,35 @@
       fill: currentColor;
     }
 
+    .btn-clear {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 36px;
+      background: var(--surface-2);
+      color: var(--text-dim);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      transition: color 0.15s, background 0.15s, border-color 0.15s;
+    }
+
+    .btn-clear:hover {
+      color: var(--accent);
+      background: var(--surface-3);
+      border-color: var(--accent);
+    }
+
+    .btn-clear svg {
+      width: 16px;
+      height: 16px;
+      fill: currentColor;
+    }
+
+    .btn-clear[hidden] {
+      display: none;
+    }
+
     .hint {
       text-align: center;
       margin-top: 14px;
@@ -834,6 +863,9 @@
     <section class="search-section">
       <div class="search-box">
         <input type="text" id="urlInput" placeholder="Paste a YouTube URL here…" spellcheck="false" autocomplete="off">
+        <button type="button" class="btn-clear" id="clearBtn" onclick="clearSearch()" title="Clear" aria-label="Clear search" hidden>
+          <svg viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+        </button>
         <button class="btn-fetch" id="fetchBtn" onclick="fetchVideo()">
           <svg viewBox="0 0 24 24">
             <path
@@ -1304,6 +1336,23 @@
 
     document.getElementById('urlInput').addEventListener('keydown', e => { if (e.key === 'Enter') fetchVideo(); });
 
+    const __urlInput = document.getElementById('urlInput');
+    const __clearBtn = document.getElementById('clearBtn');
+    const __syncClearBtn = () => { __clearBtn.hidden = __urlInput.value.length === 0; };
+    __urlInput.addEventListener('input', __syncClearBtn);
+    __syncClearBtn();
+
+    function clearSearch() {
+      __urlInput.value = '';
+      __urlInput.focus();
+      currentVideo = null;
+      selectedFormat = null;
+      showError('');
+      showResult(false);
+      document.getElementById('featuresGrid').style.display = '';
+      __syncClearBtn();
+    }
+
     async function fetchVideo() {
       const url = document.getElementById('urlInput').value.trim();
       if (!url) { showError('Please paste a YouTube URL.'); return; }
@@ -1463,23 +1512,36 @@
         // Phase 2: poll status until done or error
         await new Promise((resolve, reject) => {
           const startedAt = Date.now();
+          let lastProgress = 0;
+          let lastStage = 'Working…';
+          const fmtElapsed = (sec) => sec >= 60
+            ? `${Math.floor(sec / 60)}m ${sec % 60}s`
+            : `${sec}s`;
+          // 1s ticker so the elapsed counter advances smoothly between 3s polls.
+          const ticker = setInterval(() => {
+            const sec = Math.round((Date.now() - startedAt) / 1000);
+            updateTrayCard(cardId, lastProgress, lastStage, fmtElapsed(sec));
+          }, 1000);
+          const stop = () => clearInterval(ticker);
+
           const poll = async () => {
             try {
               const statusRes = await fetch(`${API_BASE}/api/download/status/${token}`);
               if (!statusRes.ok) {
                 const e = await statusRes.json().catch(() => ({}));
+                stop();
                 return reject(new Error(e.error || `Status check failed (${statusRes.status})`));
               }
               const status = await statusRes.json();
-              const elapsed = Math.round((Date.now() - startedAt) / 1000);
-              const elapsedStr = elapsed >= 60
-                ? `${Math.floor(elapsed / 60)}m ${elapsed % 60}s`
-                : `${elapsed}s`;
-              updateTrayCard(cardId, status.progress || 0, status.stage || 'Working…', elapsedStr);
-              if (status.state === 'done') return resolve(status);
-              if (status.state === 'error') return reject(new Error(status.error || 'Download failed on server'));
+              lastProgress = status.progress || 0;
+              lastStage = status.stage || 'Working…';
+              const sec = Math.round((Date.now() - startedAt) / 1000);
+              updateTrayCard(cardId, lastProgress, lastStage, fmtElapsed(sec));
+              if (status.state === 'done') { stop(); return resolve(status); }
+              if (status.state === 'error') { stop(); return reject(new Error(status.error || 'Download failed on server')); }
               setTimeout(poll, 3000);
             } catch (err) {
+              stop();
               reject(err);
             }
           };

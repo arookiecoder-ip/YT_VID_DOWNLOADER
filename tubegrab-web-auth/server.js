@@ -45,6 +45,9 @@ const DOWNLOAD_START_RATE_LIMIT_MAX = parsePositiveEnvInt(
 const MAX_PLAYLIST_ENTRIES = parsePositiveEnvInt(process.env.MAX_PLAYLIST_ENTRIES, 50);
 const MAX_CONCURRENT_JOBS = parsePositiveEnvInt(process.env.MAX_CONCURRENT_JOBS, 25);
 const MAX_INPUT_URL_LENGTH = 2048;
+const DEBUG_API_ERRORS =
+  String(process.env.DEBUG_API_ERRORS || "").trim().toLowerCase() === "1" ||
+  String(process.env.DEBUG_API_ERRORS || "").trim().toLowerCase() === "true";
 const DOWNLOAD_WATCHDOG_MS = 180000;
 const DOWNLOAD_WATCHDOG_TICK_MS = 15000;
 const IFRAME_LIFETIME_MS = 120000;
@@ -353,6 +356,29 @@ function runYtDlp(args) {
           );
         }
         resolve(stdout.trim());
+      },
+    );
+  });
+}
+
+function checkBinary(binary, args = ["--version"]) {
+  return new Promise((resolve) => {
+    execFile(
+      binary,
+      args,
+      { timeout: 15000, maxBuffer: 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (err) {
+          return resolve({
+            ok: false,
+            error: (stderr || err.message || "check failed").trim().slice(0, 300),
+          });
+        }
+        const firstLine = String(stdout || stderr || "")
+          .split(/\r?\n/)
+          .map((part) => part.trim())
+          .find(Boolean);
+        resolve({ ok: true, version: firstLine || "unknown" });
       },
     );
   });
@@ -784,9 +810,13 @@ app.get("/api/info", async (req, res) => {
     });
   } catch (err) {
     console.error("[/api/info]", err.message);
-    res.status(500).json({
-      error: "Failed to fetch video info. It may be restricted or unavailable.",
-    });
+    const generic = "Failed to fetch video info. It may be restricted or unavailable.";
+    if (DEBUG_API_ERRORS) {
+      return res.status(500).json({
+        error: generic + " Details: " + String(err.message || "unknown").slice(0, 220),
+      });
+    }
+    res.status(500).json({ error: generic });
   }
 });
 
@@ -1231,10 +1261,18 @@ app.get("/api/formats", async (req, res) => {
 });
 
 // Health check
-app.get("/api/health", (req, res) => {
-  res.json({
-    status: "ok",
-    ytdlp: YT_DLP,
+app.get("/api/health", async (req, res) => {
+  const [ytDlpCheck, ffmpegCheck] = await Promise.all([
+    checkBinary(YT_DLP, ["--version"]),
+    checkBinary("ffmpeg", ["-version"]),
+  ]);
+
+  const healthy = ytDlpCheck.ok && ffmpegCheck.ok;
+  res.status(healthy ? 200 : 503).json({
+    status: healthy ? "ok" : "degraded",
+    ytdlpPath: YT_DLP,
+    ytdlp: ytDlpCheck,
+    ffmpeg: ffmpegCheck,
     timestamp: new Date().toISOString(),
   });
 });

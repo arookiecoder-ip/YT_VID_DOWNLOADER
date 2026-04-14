@@ -740,21 +740,36 @@ async function runDownloadJob(token, url, formatId, isAudio) {
         let stderr = "";
         let lastProgress = 5;
         let lastActivityAt = Date.now();
+        // When merging video+audio, yt-dlp runs TWO downloads back-to-back,
+        // each going 0→100%. streamIndex tracks which one we're on so progress
+        // doesn't freeze when the second stream restarts at 0%.
+        let streamIndex = 0;
+        let expectedStreams = isAudio ? 1 : 2;
 
         const handleOutput = (text, isErr) => {
           lastActivityAt = Date.now();
+          // "[download] Destination:" marks the start of each stream.
+          const destMatches = text.match(/\[download\]\s+Destination:/g);
+          if (destMatches) streamIndex += destMatches.length;
+
           // yt-dlp emits progress to STDOUT (e.g. "[download]  42.3% of ...").
-          // We MUST drain stdout as well or the pipe buffer fills and yt-dlp
-          // blocks, which manifests as the download getting "stuck".
-          const m = text.match(/\[download\]\s+(\d+(?:\.\d+)?)%/);
-          if (m) {
-            const pct = Math.min(80, Math.round(5 + (parseFloat(m[1]) / 100) * 70));
+          // We MUST drain stdout as well or the pipe buffer fills and yt-dlp blocks.
+          const progressMatches = [...text.matchAll(/\[download\]\s+(\d+(?:\.\d+)?)%/g)];
+          if (progressMatches.length) {
+            const latest = parseFloat(progressMatches[progressMatches.length - 1][1]);
+            // Spread 5→75 across expectedStreams. If we see more streams than
+            // expected, keep extending rather than pegging at max.
+            const streams = Math.max(expectedStreams, streamIndex);
+            const currentStream = Math.max(1, streamIndex);
+            const perStream = 70 / streams;
+            const base = 5 + (currentStream - 1) * perStream;
+            const pct = Math.min(75, Math.round(base + (latest / 100) * perStream));
             if (pct > lastProgress) {
               lastProgress = pct;
-              updateJob(token, { progress: pct });
+              updateJob(token, { progress: pct, stage: "Downloading…" });
             }
           }
-          if (/\[Merger\]|\[ExtractAudio\]|post-process/i.test(text)) {
+          if (/\[Merger\]|\[ExtractAudio\]|Deleting original|post-process/i.test(text)) {
             updateJob(token, { stage: "Merging…", progress: Math.max(lastProgress, 78) });
           }
           if (isErr) stderr += text;
@@ -765,9 +780,10 @@ async function runDownloadJob(token, url, formatId, isAudio) {
         proc.stdout.on("data", (chunk) => handleOutput(chunk.toString(), false));
         proc.stderr.on("data", (chunk) => handleOutput(chunk.toString(), true));
 
-        // Watchdog: if no progress activity for 2 minutes, kill the process.
+        // Watchdog: if no progress activity for 3 minutes, kill the process.
+        // (Slow merges on long videos can take >2min between log lines.)
         const watchdog = setInterval(() => {
-          if (Date.now() - lastActivityAt > 120000) {
+          if (Date.now() - lastActivityAt > 180000) {
             try { proc.kill("SIGKILL"); } catch {}
           }
         }, 15000);
@@ -1033,6 +1049,23 @@ app.get("/api/health", (req, res) => {
     status: "ok",
     ytdlp: YT_DLP,
     timestamp: new Date().toISOString(),
+  });
+});
+
+// Build timestamp: most recent mtime across server.js and public/index.html.
+// Frontend displays this in the footer so you can confirm deploys went through.
+const BUILD_STARTED_AT = new Date().toISOString();
+app.get("/api/version", (req, res) => {
+  let latest = 0;
+  for (const rel of ["server.js", "public/index.html"]) {
+    try {
+      const m = fs.statSync(path.join(__dirname, rel)).mtimeMs;
+      if (m > latest) latest = m;
+    } catch {}
+  }
+  res.json({
+    lastPatched: latest ? new Date(latest).toISOString() : null,
+    startedAt: BUILD_STARTED_AT,
   });
 });
 

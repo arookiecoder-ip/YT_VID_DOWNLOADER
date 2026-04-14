@@ -908,6 +908,7 @@
     <footer class="disclaimer">
       Please only download content you have the right to access.<br>
       Respect copyright laws and YouTube's Terms of Service.
+      <div id="buildStamp" style="margin-top:8px;opacity:0.55;font-size:11px;">Loading version…</div>
     </footer>
   </div>
 
@@ -935,6 +936,26 @@
         e.returnValue = '';
       }
     });
+
+    (async () => {
+      const el = document.getElementById('buildStamp');
+      if (!el) return;
+      try {
+        const r = await fetch(`${API_BASE}/api/version`, { cache: 'no-store' });
+        if (!r.ok) throw new Error('version fetch failed');
+        const { lastPatched } = await r.json();
+        if (!lastPatched) { el.textContent = 'Version info unavailable'; return; }
+        const d = new Date(lastPatched);
+        const fmt = d.toLocaleString(undefined, {
+          year: 'numeric', month: 'short', day: '2-digit',
+          hour: '2-digit', minute: '2-digit',
+        });
+        el.textContent = `Last patched: ${fmt}`;
+        el.title = `Exact: ${d.toISOString()}`;
+      } catch {
+        el.textContent = 'Last patched: unknown';
+      }
+    })();
 
     function isValidYouTubeURL(url) {
       return [

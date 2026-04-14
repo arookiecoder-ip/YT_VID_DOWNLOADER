@@ -1015,20 +1015,56 @@
       }
     })();
 
+    const YT_HOSTS = new Set([
+      'youtube.com', 'www.youtube.com', 'm.youtube.com',
+      'music.youtube.com', 'youtu.be',
+    ]);
+    const YT_VIDEO_ID_RE = /^[\w-]{11}$/;
+    const YT_LIST_ID_RE = /^[\w-]{1,64}$/;
+
+    function parseYouTubeURL(raw) {
+      const input = String(raw || '').trim();
+      if (!input) return null;
+      let u;
+      try { u = new URL(input); } catch {
+        try { u = new URL('https://' + input); } catch { return null; }
+      }
+      if (u.protocol !== 'http:' && u.protocol !== 'https:') return null;
+      const host = u.hostname.toLowerCase();
+      if (!YT_HOSTS.has(host)) return null;
+
+      const path = u.pathname;
+      const videoId = u.searchParams.get('v');
+      const listId = u.searchParams.get('list');
+      const shortMatch = path.match(/^\/(shorts|live|embed)\/([\w-]{11})/);
+      const shortId = host === 'youtu.be' ? path.slice(1).split('/')[0] : null;
+
+      const validVideo =
+        (videoId && YT_VIDEO_ID_RE.test(videoId)) ||
+        (shortMatch && YT_VIDEO_ID_RE.test(shortMatch[2])) ||
+        (shortId && YT_VIDEO_ID_RE.test(shortId));
+      const validList = listId && YT_LIST_ID_RE.test(listId);
+      const isPlaylistPath = path.startsWith('/playlist');
+      if (!validVideo && !validList) return null;
+
+      return {
+        videoId: validVideo
+          ? (videoId || (shortMatch && shortMatch[2]) || shortId)
+          : null,
+        listId: validList ? listId : null,
+        isPlaylistPath,
+      };
+    }
+
     function isValidYouTubeURL(url) {
-      return [
-        /^(https?:\/\/)?(www\.)?youtube\.com\/watch\?.*v=[\w-]{11}/,
-        /^(https?:\/\/)?(www\.)?youtube\.com\/shorts\/[\w-]{11}/,
-        /^(https?:\/\/)?(www\.)?youtube\.com\/live\/[\w-]{11}/,
-        /^(https?:\/\/)?youtu\.be\/[\w-]{11}/,
-        /^(https?:\/\/)?(www\.)?youtube\.com\/embed\/[\w-]{11}/,
-        /^(https?:\/\/)?(www\.)?youtube\.com\/playlist\?.*list=[\w-]+/,
-        /^(https?:\/\/)?(www\.)?youtube\.com\/watch\?.*list=[\w-]+/,
-      ].some(p => p.test(url.trim()));
+      return parseYouTubeURL(url) !== null;
     }
 
     function isPlaylistURL(url) {
-      return /[?&]list=[\w-]+/.test(String(url || '').trim());
+      const p = parseYouTubeURL(url);
+      if (!p) return false;
+      if (p.isPlaylistPath && p.listId) return true;
+      return Boolean(p.listId) && !p.videoId;
     }
 
     function formatViews(n) {
@@ -1218,13 +1254,20 @@
       return 'Download';
     }
 
-    function queueIframeDownload(params) {
+    function queueIframeDownload(params, onSettled) {
       const iframe = document.createElement('iframe');
       iframe.style.display = 'none';
       iframe.name = 'downloadFrame' + Date.now() + '_' + (downloadFrameCounter++);
       iframe.src = `${API_BASE}/api/download?${params.toString()}`;
       document.body.appendChild(iframe);
-      setTimeout(() => iframe.remove(), 120000);
+      let settled = false;
+      const settle = () => {
+        if (settled) return;
+        settled = true;
+        if (typeof onSettled === 'function') onSettled();
+      };
+      iframe.addEventListener('load', () => setTimeout(settle, 2000));
+      setTimeout(() => { settle(); iframe.remove(); }, 120000);
     }
 
     // ── Downloads Tray ──
@@ -1364,7 +1407,11 @@
       if (s) document.getElementById('featuresGrid').style.display = 'none';
     }
 
-    document.getElementById('urlInput').addEventListener('keydown', e => { if (e.key === 'Enter') fetchVideo(); });
+    document.getElementById('urlInput').addEventListener('keydown', e => {
+      if (e.key !== 'Enter') return;
+      if (document.getElementById('fetchBtn').disabled) return;
+      fetchVideo();
+    });
 
     const __urlInput = document.getElementById('urlInput');
     const __clearBtn = document.getElementById('clearBtn');
@@ -1480,11 +1527,12 @@
       if (typeof window.showSaveFilePicker !== 'function') {
         const cardId = createTrayCard(videoTitle, suggestedFilename);
         activeDownloads++;
-        queueIframeDownload(params);
+        queueIframeDownload(params, () => {
+          activeDownloads = Math.max(0, activeDownloads - 1);
+        });
         updateTrayCard(cardId, 100, 'Started in browser', 'Check your downloads bar');
         finishTrayCard(cardId, true, 'Check your downloads bar');
         showToast('Download started — check your browser downloads bar.');
-        setTimeout(() => { activeDownloads = Math.max(0, activeDownloads - 1); }, 120000);
         return;
       }
 
@@ -1504,11 +1552,12 @@
         // Picker failed — fallback to iframe
         const cardId = createTrayCard(videoTitle, suggestedFilename);
         activeDownloads++;
-        queueIframeDownload(params);
+        queueIframeDownload(params, () => {
+          activeDownloads = Math.max(0, activeDownloads - 1);
+        });
         updateTrayCard(cardId, 100, 'Started in browser', 'Check your downloads bar');
         finishTrayCard(cardId, true, 'Check your downloads bar');
         showToast('Folder picker unavailable, using browser download instead.');
-        setTimeout(() => { activeDownloads = Math.max(0, activeDownloads - 1); }, 120000);
         return;
       }
 
@@ -1542,12 +1591,14 @@
         // Phase 2: poll status until done or error
         await new Promise((resolve, reject) => {
           const startedAt = Date.now();
+          const MAX_ELAPSED_MS = 30 * 60 * 1000;
+          const MAX_CONSECUTIVE_FAILURES = 5;
+          let consecutiveFailures = 0;
           let lastProgress = 0;
           let lastStage = 'Working…';
           const fmtElapsed = (sec) => sec >= 60
             ? `${Math.floor(sec / 60)}m ${sec % 60}s`
             : `${sec}s`;
-          // 1s ticker so the elapsed counter advances smoothly between 3s polls.
           const ticker = setInterval(() => {
             const sec = Math.round((Date.now() - startedAt) / 1000);
             updateTrayCard(cardId, lastProgress, lastStage, fmtElapsed(sec));
@@ -1555,6 +1606,10 @@
           const stop = () => clearInterval(ticker);
 
           const poll = async () => {
+            if (Date.now() - startedAt > MAX_ELAPSED_MS) {
+              stop();
+              return reject(new Error('Download timed out after 30 minutes.'));
+            }
             try {
               const statusRes = await fetch(`${API_BASE}/api/download/status/${token}`);
               if (!statusRes.ok) {
@@ -1562,6 +1617,7 @@
                 stop();
                 return reject(new Error(e.error || `Status check failed (${statusRes.status})`));
               }
+              consecutiveFailures = 0;
               const status = await statusRes.json();
               lastProgress = status.progress || 0;
               lastStage = status.stage || 'Working…';
@@ -1571,8 +1627,12 @@
               if (status.state === 'error') { stop(); return reject(new Error(status.error || 'Download failed on server')); }
               setTimeout(poll, 3000);
             } catch (err) {
-              stop();
-              reject(err);
+              consecutiveFailures += 1;
+              if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+                stop();
+                return reject(new Error('Lost connection to server.'));
+              }
+              setTimeout(poll, 3000);
             }
           };
           poll();

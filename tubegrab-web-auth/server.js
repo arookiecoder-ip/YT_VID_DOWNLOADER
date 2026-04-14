@@ -200,6 +200,7 @@ function isValidYouTubeURL(url) {
   return [
     /^(https?:\/\/)?(www\.)?youtube\.com\/watch\?.*v=[\w-]{11}/,
     /^(https?:\/\/)?(www\.)?youtube\.com\/shorts\/[\w-]{11}/,
+    /^(https?:\/\/)?(www\.)?youtube\.com\/live\/[\w-]{11}/,
     /^(https?:\/\/)?youtu\.be\/[\w-]{11}/,
     /^(https?:\/\/)?(www\.)?youtube\.com\/embed\/[\w-]{11}/,
     /^(https?:\/\/)?(www\.)?youtube\.com\/playlist\?.*list=[\w-]+/,

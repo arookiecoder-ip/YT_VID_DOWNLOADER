@@ -460,19 +460,27 @@ function parseFormats(rawFormats) {
   for (const [height, slot] of byHeight.entries()) {
     if (slot.progressive) {
       const format = slot.progressive;
+      // Use a resilient selector instead of the raw format_id.
+      // Raw IDs (e.g. "22", "18") can disappear between /api/info and download time.
       videoFormats.push({
-        id: format.format_id,
+        id:
+          "bestvideo[vcodec^=avc1][height=" +
+          height +
+          "]+bestaudio[ext=m4a]/bestvideo[height=" +
+          height +
+          "]+bestaudio/best[height<=" +
+          height +
+          "]",
         label: height + "p",
         height,
         detail:
-          (format.ext || "mp4").toUpperCase() +
-          " • " +
+          "MP4 • " +
           fmtBytes(format.filesize || format.filesize_approx),
         type: "video",
-        ext: format.ext || "mp4",
+        ext: "mp4",
         filesize: format.filesize || null,
         filesizeApprox: format.filesize_approx || null,
-        sizeExact: Boolean(format.filesize),
+        sizeExact: false,
         badge: height >= 1080 ? "HD" : "",
       });
       continue;

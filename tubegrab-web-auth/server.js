@@ -1481,14 +1481,39 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
 
   const isAudio = ext === "mp3" || formatId === "bestaudio";
 
+  // Abort controller — triggered when client disconnects or hits /cancel
+  let aborted = false;
+  let currentProc = null; // the yt-dlp process currently running
+  const abort = (reason = "cancelled") => {
+    if (aborted) return;
+    aborted = true;
+    console.log("[playlist-zip] aborting:", reason);
+    if (currentProc) { try { currentProc.kill("SIGKILL"); } catch {} }
+  };
+
+  // Register this job so /cancel can reach it
+  if (progressId) zipProgressChannels.set("abort:" + progressId, { abort });
+
+  // Detect client disconnect (tab closed, network drop, etc.)
+  res.on("close", () => abort("client disconnected"));
+
   // Helper: send SSE event if a progress channel is registered
   const emit = (event, data) => {
     const ch = zipProgressChannels.get(progressId);
-    if (ch) ch.send(event, data);
+    if (ch && ch.send) ch.send(event, data);
   };
   const closeProgress = () => {
     const ch = zipProgressChannels.get(progressId);
-    if (ch) { ch.close(); zipProgressChannels.delete(progressId); }
+    if (ch && ch.close) { ch.close(); }
+    zipProgressChannels.delete(progressId);
+    zipProgressChannels.delete("abort:" + progressId);
+  };
+
+  // Temp file tracker — cleaned up on abort or completion
+  const tempFiles = new Set();
+  const cleanupTempFiles = () => {
+    for (const f of tempFiles) { try { fs.unlinkSync(f); } catch {} }
+    tempFiles.clear();
   };
 
   let entries;
@@ -1511,6 +1536,8 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
       return res.status(400).json({ error: "Playlist has no downloadable entries." });
     }
 
+    if (aborted) { closeProgress(); return res.destroy(); }
+
     const playlistTitle = sanitizeFilename(playlist.title || "Playlist");
     const outputExt = isAudio ? "mp3" : "mp4";
     const total = entries.length;
@@ -1525,21 +1552,21 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
     const archive = archiver("zip", { zlib: { level: 0 } });
     archive.on("warning", (err) => console.warn("[playlist-zip] archiver warning:", err.message));
     archive.on("error", (err) => {
-      console.error("[playlist-zip] archiver error:", err.message);
+      if (!aborted) console.error("[playlist-zip] archiver error:", err.message);
       res.destroy(err);
     });
     archive.pipe(res);
 
     let completed = 0;
     let failed = 0;
-    // Temp files created per video; cleaned up after each one is added to archive
-    const tempFiles = [];
 
     // Whether this format requires ffmpeg merging (video+audio streams)
     // yt-dlp cannot merge to stdout — must write to a temp file first
     const needsMerge = !isAudio && formatId.includes("+");
 
     for (let i = 0; i < entries.length; i++) {
+      if (aborted) break;
+
       const entry = entries[i];
       const title = sanitizeFilename(entry.title) || "video-" + (i + 1);
       const filename = title + "." + outputExt;
@@ -1551,15 +1578,15 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
       try {
         if (needsMerge) {
           // Merged formats (e.g. bestvideo+bestaudio) require ffmpeg post-processing.
-          // yt-dlp cannot pipe a merged output to stdout — it writes separate streams
-          // then muxes them. We download to a temp file, add it to the archive, then delete it.
+          // yt-dlp cannot pipe a merged output to stdout — download to temp file first.
           tempPath = path.join(os.tmpdir(), "plzip-" + crypto.randomUUID() + "." + outputExt);
-          tempFiles.push(tempPath);
+          tempFiles.add(tempPath);
 
           await new Promise((resolve, reject) => {
             const args = withCookies(buildDownloadArgs(formatId, isAudio, tempPath));
             args.push(entry.url);
             const proc = spawn(YT_DLP, args, { stdio: ["ignore", "pipe", "pipe"] });
+            currentProc = proc;
 
             let stderrBuf = "";
             proc.stderr.on("data", (d) => {
@@ -1574,28 +1601,32 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
             proc.stdout.on("data", () => {}); // drain stdout
             proc.on("error", reject);
             proc.on("close", (code) => {
+              currentProc = null;
+              if (aborted) return reject(new Error("cancelled"));
               if (code !== 0) reject(new Error(stderrBuf.trim().slice(-300) || "yt-dlp exited with code " + code));
               else resolve();
             });
           });
 
-          // Append completed temp file into archive, then delete it once archiver
-          // has finished reading it (the 'entry' event fires after each entry is processed)
-          await new Promise((resolve, reject) => {
+          if (aborted) { try { fs.unlinkSync(tempPath); } catch {} tempFiles.delete(tempPath); break; }
+
+          // Append completed temp file into archive, delete once archiver has read it
+          await new Promise((resolve) => {
             archive.once("entry", () => {
               try { fs.unlinkSync(tempPath); } catch {}
-              tempFiles.splice(tempFiles.indexOf(tempPath), 1);
+              tempFiles.delete(tempPath);
               resolve();
             });
             archive.file(tempPath, { name: filename });
           });
 
         } else {
-          // Single-stream formats (audio or single video quality) can pipe stdout directly
+          // Single-stream formats can pipe stdout directly
           await new Promise((resolve, reject) => {
             const args = withCookies(buildDownloadArgs(formatId, isAudio, "-"));
             args.push(entry.url);
             const proc = spawn(YT_DLP, args, { stdio: ["ignore", "pipe", "pipe"] });
+            currentProc = proc;
 
             let stderrBuf = "";
             proc.stderr.on("data", (d) => {
@@ -1606,18 +1637,22 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
             archive.append(proc.stdout, { name: filename });
             proc.on("error", reject);
             proc.on("close", (code) => {
+              currentProc = null;
+              if (aborted) return reject(new Error("cancelled"));
               if (code !== 0) reject(new Error(stderrBuf.trim().slice(-300) || "yt-dlp exited with code " + code));
               else resolve();
             });
           });
         }
 
+        if (aborted) break;
         completed++;
         emit("done", { current: i + 1, total, title: entry.title || title, completed, failed });
       } catch (err) {
+        if (aborted) break; // don't log noise on intentional cancel
         failed++;
         console.error("[playlist-zip] failed:", entry.url, err.message);
-        if (tempPath) { try { fs.unlinkSync(tempPath); } catch {} }
+        if (tempPath) { try { fs.unlinkSync(tempPath); } catch {} tempFiles.delete(tempPath); }
         archive.append("Download failed: " + err.message.slice(0, 300), {
           name: "FAILED - " + sanitizeFilename(entry.title || "video-" + (i + 1)) + ".txt",
         });
@@ -1625,13 +1660,19 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
       }
     }
 
-    await archive.finalize();
-    // Clean up any leftover temp files (shouldn't happen, but safety net)
-    for (const f of tempFiles) { try { fs.unlinkSync(f); } catch {} }
-    emit("complete", { total, completed, failed });
+    cleanupTempFiles();
+
+    if (!aborted) {
+      await archive.finalize();
+      emit("complete", { total, completed, failed });
+    } else {
+      archive.abort();
+      res.destroy();
+    }
     closeProgress();
   } catch (err) {
-    console.error("[playlist-zip]", err.message);
+    cleanupTempFiles();
+    if (!aborted) console.error("[playlist-zip]", err.message);
     emit("zip-error", { error: err.message.slice(0, 300) });
     closeProgress();
     if (!res.headersSent) {
@@ -1639,6 +1680,16 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
     }
     res.destroy(err);
   }
+});
+
+// POST /api/download/playlist-zip/cancel/:id — cancel an in-progress playlist ZIP
+// Called via sendBeacon on page unload so the server stops yt-dlp and deletes temp files.
+app.post("/api/download/playlist-zip/cancel/:id", (req, res) => {
+  const id = String(req.params.id || "").trim();
+  if (!id || !/^[0-9a-f]{32}$/.test(id)) return res.status(400).end();
+  const abortHandle = zipProgressChannels.get("abort:" + id);
+  if (abortHandle) abortHandle.abort("cancel endpoint");
+  res.status(204).end();
 });
 
 // GET /api/download — legacy direct stream (used by playlist iframe fallback)

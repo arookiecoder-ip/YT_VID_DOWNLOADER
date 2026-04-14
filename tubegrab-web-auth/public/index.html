@@ -988,11 +988,25 @@
     let selectedFormat = null;
     let downloadFrameCounter = 0;
     let activeDownloads = 0;
+    let activePlaylistProgressId = null; // set while a playlist ZIP is in progress
 
+    // When the page is closed/navigated away:
+    // 1. Warn the user if a download is active (beforeunload)
+    // 2. Fire a cancel beacon so the server kills yt-dlp and deletes temp files (pagehide)
     window.addEventListener('beforeunload', e => {
       if (activeDownloads > 0) {
         e.preventDefault();
         e.returnValue = '';
+      }
+    });
+
+    // pagehide fires reliably on tab close, navigation, and mobile backgrounding.
+    // sendBeacon is the only API guaranteed to complete after the page is gone.
+    window.addEventListener('pagehide', () => {
+      if (activePlaylistProgressId) {
+        navigator.sendBeacon(
+          `${API_BASE}/api/download/playlist-zip/cancel/${activePlaylistProgressId}`
+        );
       }
     });
 
@@ -1452,6 +1466,9 @@
       let zipCompleted = 0;
       let zipFailed = 0;
 
+      // Track this progress ID globally so pagehide can fire the cancel beacon
+      activePlaylistProgressId = progressId;
+
       try {
         // Open SSE connection first so server can immediately send events
         await new Promise((resolve, reject) => {
@@ -1577,6 +1594,7 @@
         showToast(err.message || 'Playlist ZIP failed', 'error');
       } finally {
         if (sse) sse.close();
+        activePlaylistProgressId = null; // no longer need the cancel beacon
         btn.disabled = false;
         btn.querySelector('span').textContent = getDefaultDownloadButtonLabel();
       }

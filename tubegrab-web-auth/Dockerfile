@@ -14,4 +14,5 @@ RUN mkdir -p downloads
 
 EXPOSE 3000
 ENV NODE_ENV=production
-CMD ["node", "server.js"]
+# Update yt-dlp to latest at container start to avoid stale cached binaries
+CMD yt-dlp -U --quiet 2>/dev/null || true && node server.js

@@ -52,8 +52,13 @@ const DOWNLOAD_WATCHDOG_MS = 180000;
 const DOWNLOAD_WATCHDOG_TICK_MS = 15000;
 const IFRAME_LIFETIME_MS = 120000;
 const JOB_TTL_MS = 30 * 60 * 1000;
-const JOB_SWEEP_INTERVAL_MS = 10 * 60 * 1000;
+const JOB_SWEEP_INTERVAL_MS = 2 * 60 * 1000;  // sweep every 2 min instead of 10
 const PROGRESS_RANGE = 70;
+const JOB_MAP_CAP = parsePositiveEnvInt(process.env.JOB_MAP_CAP, 500);
+const MAX_DURATION_SECONDS = parsePositiveEnvInt(process.env.MAX_DURATION_SECONDS, 0) || null;
+const MAX_FILESIZE_BYTES = parsePositiveEnvInt(process.env.MAX_FILESIZE_BYTES, 0) || null;
+const INTERNAL_TOKEN = process.env.INTERNAL_TOKEN || "";
+const BIND_HOST = process.env.BIND_HOST || "0.0.0.0";
 const authFailuresByIp = new Map();
 
 if (TRUST_PROXY) {
@@ -257,6 +262,17 @@ app.use(
   }),
 );
 app.use(globalLimiter);
+// Reject requests missing the shared internal secret set by Nginx.
+// Prevents bypassing Nginx/Cloudflare by hitting the Node port directly.
+if (INTERNAL_TOKEN) {
+  app.use((req, res, next) => {
+    const provided = String(req.headers["x-internal-token"] || "");
+    if (!safeEqualString(provided, INTERNAL_TOKEN)) {
+      return res.status(403).send("Forbidden");
+    }
+    next();
+  });
+}
 app.use(cors());
 app.use(express.json({ limit: "32kb" }));
 app.use(basicAuthMiddleware);
@@ -336,22 +352,42 @@ function normalizeRequestUrl(raw) {
   return normalized;
 }
 
-// If the configured cookie file is read-only (e.g. a Docker bind-mount with :ro),
-// yt-dlp will fail when it tries to update the file after use.
-// To avoid this, we copy the cookie file to a writable temp path once at startup
-// and point yt-dlp at the copy.
+// Copy the cookie file to a writable temp path so yt-dlp can update it.
+// Also watch the source file for changes and re-copy automatically,
+// so new cookies can be deployed without restarting the container.
 let RESOLVED_COOKIES = "";
-if (YTDLP_COOKIES && fs.existsSync(YTDLP_COOKIES)) {
+const TMP_COOKIES = path.join(os.tmpdir(), "tubegrab_cookies.txt");
+
+function refreshCookies() {
+  if (!YTDLP_COOKIES || !fs.existsSync(YTDLP_COOKIES)) return;
   try {
-    const tmpCookies = path.join(os.tmpdir(), "tubegrab_cookies.txt");
-    fs.copyFileSync(YTDLP_COOKIES, tmpCookies);
-    fs.chmodSync(tmpCookies, 0o600);
-    RESOLVED_COOKIES = tmpCookies;
-    console.log("[cookies] Copied cookie file to writable temp path:", tmpCookies);
+    fs.copyFileSync(YTDLP_COOKIES, TMP_COOKIES);
+    fs.chmodSync(TMP_COOKIES, 0o600);
+    RESOLVED_COOKIES = TMP_COOKIES;
+    console.log("[cookies] Refreshed cookie file →", TMP_COOKIES);
   } catch (e) {
-    console.warn("[cookies] Could not copy cookie file, falling back to original path:", e.message);
-    RESOLVED_COOKIES = YTDLP_COOKIES;
+    console.warn("[cookies] Could not refresh cookie file:", e.message);
+    if (!RESOLVED_COOKIES) RESOLVED_COOKIES = YTDLP_COOKIES;
   }
+}
+
+if (YTDLP_COOKIES) {
+  refreshCookies();
+  try {
+    const watcher = fs.watch(YTDLP_COOKIES, { persistent: false }, (eventType) => {
+      if (eventType === "change" || eventType === "rename") {
+        console.log("[cookies] Source file changed, re-copying…");
+        setTimeout(refreshCookies, 500); // wait for write to flush
+      }
+    });
+    watcher.on("error", (err) => {
+      console.warn("[cookies] fs.watch error (will not auto-refresh):", err.message);
+    });
+  } catch (e) {
+    console.warn("[cookies] Cannot watch cookie file:", e.message);
+  }
+  // Fallback poll every 5 min in case fs.watch doesn't fire (e.g. Docker Desktop on Mac/Windows)
+  setInterval(refreshCookies, 5 * 60 * 1000).unref();
 }
 
 function withCookies(args) {
@@ -361,27 +397,41 @@ function withCookies(args) {
   return args;
 }
 
-function runYtDlp(args) {
-  // Use Node.js runtime for n-challenge solving (requires yt-dlp[default] + node).
-  const baseArgs = [
-    "--js-runtimes", "node",
-    ...withCookies(args),
-  ];
+function runYtDlpRaw(args) {
   return new Promise((resolve, reject) => {
     execFile(
       YT_DLP,
-      baseArgs,
+      args,
       { timeout: 90000, maxBuffer: 20 * 1024 * 1024 },
       (err, stdout, stderr) => {
-        if (err) {
-          return reject(
-            new Error((stderr || err.message || "yt-dlp failed").trim()),
-          );
-        }
+        if (err) return reject(new Error((stderr || err.message || "yt-dlp failed").trim()));
         resolve(stdout.trim());
       },
     );
   });
+}
+
+async function runYtDlp(args) {
+  // Primary: use Node.js JS runtime for n-challenge solving.
+  const primaryArgs = ["--js-runtimes", "node", ...withCookies(args)];
+  try {
+    return await runYtDlpRaw(primaryArgs);
+  } catch (err) {
+    const msg = err.message || "";
+    const isChallenge =
+      /Sign in to confirm|n.challenge|nsig|challenge solving/i.test(msg) ||
+      /HTTP Error 429|Too Many Requests/i.test(msg) ||
+      /Only images are available/i.test(msg);
+    if (!isChallenge) throw err;
+    // Retry with tv_embedded player client as fallback
+    console.warn("[yt-dlp] n-challenge detected, retrying with tv_embedded…");
+    const fallbackArgs = [
+      "--js-runtimes", "node",
+      "--extractor-args", "youtube:player_client=tv_embedded",
+      ...withCookies(args),
+    ];
+    return runYtDlpRaw(fallbackArgs);
+  }
 }
 
 function checkBinary(binary, args = ["--version"]) {
@@ -705,6 +755,21 @@ async function probeDownloadSize(url, formatId, isAudio) {
     const approxBytes = toPositiveInt(approxRaw);
     const durationSeconds = toPositiveInt(durationRaw);
 
+    // Enforce duration limit
+    if (MAX_DURATION_SECONDS && durationSeconds && durationSeconds > MAX_DURATION_SECONDS) {
+      throw new Error(
+        `Video is too long (${Math.round(durationSeconds / 60)} min). ` +
+        `Maximum allowed is ${Math.round(MAX_DURATION_SECONDS / 60)} min.`
+      );
+    }
+    // Enforce file size limit
+    const estimatedBytes = exactBytes || approxBytes;
+    if (MAX_FILESIZE_BYTES && estimatedBytes && estimatedBytes > MAX_FILESIZE_BYTES) {
+      const mb = Math.round(estimatedBytes / 1e6);
+      const limitMb = Math.round(MAX_FILESIZE_BYTES / 1e6);
+      throw new Error(`File is too large (~${mb} MB). Maximum allowed is ${limitMb} MB.`);
+    }
+
     if (isAudio) {
       // MP3 conversion changes final bytes, so this is only an estimate.
       const durationEstimate = durationSeconds
@@ -719,7 +784,11 @@ async function probeDownloadSize(url, formatId, isAudio) {
     if (exactBytes) return { bytes: exactBytes, exact: true };
     if (approxBytes) return { bytes: approxBytes, exact: false };
     return { bytes: null, exact: false };
-  } catch {
+  } catch (err) {
+    // Re-throw limit errors so callers can surface them to the user
+    if (err.message && (err.message.includes("too long") || err.message.includes("too large"))) {
+      throw err;
+    }
     return { bytes: null, exact: false };
   }
 }
@@ -757,6 +826,15 @@ function buildDownloadArgs(formatId, isAudio, outputTarget = "-") {
   return args;
 }
 
+// Send a JSON response with Cache-Control and ETag headers.
+// Clients (including Cloudflare) can cache for up to 5 minutes.
+function sendCachedJson(req, res, body) {
+  const etag = '"' + crypto.createHash("sha1").update(JSON.stringify(body)).digest("hex").slice(0, 16) + '"';
+  res.set({ "Cache-Control": "private, max-age=300", "ETag": etag });
+  if (req.headers["if-none-match"] === etag) return res.status(304).end();
+  return res.json(body);
+}
+
 // GET /api/info
 app.get("/api/info", async (req, res) => {
   const url = normalizeRequestUrl(req.query.url);
@@ -792,7 +870,7 @@ app.get("/api/info", async (req, res) => {
       const firstThumb =
         entries.find((entry) => entry.thumbnail)?.thumbnail || null;
 
-      return res.json({
+      return sendCachedJson(req, res, {
         kind: "playlist",
         id: playlist.id || "playlist",
         title: playlist.title || "Untitled Playlist",
@@ -821,7 +899,7 @@ app.get("/api/info", async (req, res) => {
     const formats = parseFormats(info.formats || []);
     const fallback = formats.length > 1 ? formats : getFallbackFormats(false);
 
-    res.json({
+    sendCachedJson(req, res, {
       kind: "video",
       id: info.id,
       title: info.title || "Untitled",
@@ -925,11 +1003,21 @@ function cleanupJob(token) {
   jobs.delete(token);
 }
 
-// Sweep expired jobs.
+// Sweep expired jobs every 2 min. Also enforce JOB_MAP_CAP by evicting
+// the oldest completed/errored jobs if the Map grows too large.
 const jobSweepTimer = setInterval(() => {
   const now = Date.now();
   for (const [token, job] of jobs.entries()) {
     if (now - job.createdAt > JOB_TTL_MS) cleanupJob(token);
+  }
+  if (jobs.size > JOB_MAP_CAP) {
+    const candidates = [...jobs.entries()]
+      .filter(([, j]) => j.state !== "pending")
+      .sort(([, a], [, b]) => a.createdAt - b.createdAt);
+    for (const [token] of candidates) {
+      if (jobs.size <= JOB_MAP_CAP) break;
+      cleanupJob(token);
+    }
   }
 }, JOB_SWEEP_INTERVAL_MS);
 if (typeof jobSweepTimer.unref === "function") {
@@ -1138,7 +1226,7 @@ async function runDownloadJob(token, url, formatId, isAudio) {
 }
 
 // POST /api/download/start — kick off background job, return token immediately
-app.post("/api/download/start", downloadStartLimiter, (req, res) => {
+app.post("/api/download/start", downloadStartLimiter, async (req, res) => {
   const source = req.body || {};
   const url = normalizeRequestUrl(source.url);
   const formatId = String(source.formatId || "best").trim();
@@ -1148,17 +1236,29 @@ app.post("/api/download/start", downloadStartLimiter, (req, res) => {
     return res.status(400).json({ error: "Invalid or missing YouTube URL" });
   }
 
-  if (countActiveJobs() >= MAX_CONCURRENT_JOBS) {
-    res.set("Retry-After", "60");
-    return res
-      .status(429)
-      .json({ error: "Server is busy. Please try again in a minute." });
+  const isAudio = ext === "mp3" || formatId === "bestaudio";
+
+  // Probe for duration/size limits before creating the job (only when limits are configured)
+  if (MAX_DURATION_SECONDS || MAX_FILESIZE_BYTES) {
+    try {
+      await probeDownloadSize(url, formatId, isAudio);
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
   }
 
-  const isAudio = ext === "mp3" || formatId === "bestaudio";
-  const token = crypto.randomBytes(16).toString("hex");
-  const clientId = getClientId(req);
+  // Atomic check-and-create: no await between the count check and Map insertion.
+  // JS is single-threaded so this is safe as long as there's no await in between.
+  if (countActiveJobs() >= MAX_CONCURRENT_JOBS) {
+    res.set("Retry-After", "60");
+    return res.status(429).json({ error: "Server is busy. Please try again in a minute." });
+  }
+  if (jobs.size >= JOB_MAP_CAP) {
+    return res.status(503).json({ error: "Job queue is full. Please try again shortly." });
+  }
 
+  const token = crypto.randomBytes(32).toString("hex");
+  const clientId = getClientId(req);
   createJob(token, { url, formatId, isAudio, clientId });
   runDownloadJob(token, url, formatId, isAudio);
 
@@ -1308,12 +1408,26 @@ app.get("/api/health", async (req, res) => {
     checkBinary("ffmpeg", ["-version"]),
   ]);
 
+  let diskFreeBytes = null;
+  try {
+    // fs.statfsSync available Node 19+ (we use node:20-slim so this is safe)
+    const stat = fs.statfsSync(os.tmpdir());
+    diskFreeBytes = stat.bfree * stat.bsize;
+  } catch {}
+
+  const cookieFileExists = RESOLVED_COOKIES
+    ? fs.existsSync(RESOLVED_COOKIES)
+    : YTDLP_COOKIES ? fs.existsSync(YTDLP_COOKIES) : null;
+
   const healthy = ytDlpCheck.ok && ffmpegCheck.ok;
   res.status(healthy ? 200 : 503).json({
     status: healthy ? "ok" : "degraded",
     ytdlpPath: YT_DLP,
     ytdlp: ytDlpCheck,
     ffmpeg: ffmpegCheck,
+    cookies: { configured: Boolean(YTDLP_COOKIES), fileExists: cookieFileExists },
+    disk: { freeBytesApprox: diskFreeBytes },
+    jobs: { active: countActiveJobs(), total: jobs.size, cap: JOB_MAP_CAP },
     timestamp: new Date().toISOString(),
   });
 });
@@ -1341,8 +1455,8 @@ app.get("/{*splat}", (req, res) => {
 });
 
 function startServer(port = PORT) {
-  return app.listen(port, () => {
-    console.log("\n  TubeGrab running at http://localhost:" + port + "\n");
+  return app.listen(port, BIND_HOST, () => {
+    console.log("\n  TubeGrab running at http://" + BIND_HOST + ":" + port + "\n");
   });
 }
 

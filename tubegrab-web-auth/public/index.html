@@ -1442,13 +1442,87 @@
 
       btn.disabled = true;
       btn.querySelector('span').textContent = 'Preparing ZIP…';
-      updateTrayCard(cardId, 0, 'Server is downloading videos…', `0 / ${total} — this may take a while`);
+      updateTrayCard(cardId, 0, 'Fetching playlist info…', `0 / ${total}`);
+
+      // Generate a random progress ID and open SSE channel before starting the ZIP request
+      const progressId = Array.from(crypto.getRandomValues(new Uint8Array(16)))
+        .map(b => b.toString(16).padStart(2, '0')).join('');
+
+      let sse = null;
+      let zipCompleted = 0;
+      let zipFailed = 0;
 
       try {
+        // Open SSE connection first so server can immediately send events
+        await new Promise((resolve, reject) => {
+          sse = new EventSource(`${API_BASE}/api/download/playlist-zip/progress/${progressId}`);
+          sse.onopen = () => resolve();
+          sse.onerror = () => reject(new Error('Could not open progress stream'));
+          setTimeout(resolve, 1500); // resolve anyway after 1.5s if onopen doesn't fire
+        });
+
+        sse.addEventListener('status', (e) => {
+          const d = JSON.parse(e.data);
+          updateTrayCard(cardId, 2, d.stage, `0 / ${total}`);
+        });
+
+        sse.addEventListener('downloading', (e) => {
+          const d = JSON.parse(e.data);
+          const pct = Math.round(((d.current - 1) / d.total) * 90);
+          updateTrayCard(cardId, pct,
+            `Downloading ${d.current} / ${d.total}`,
+            `"${d.title}"`
+          );
+        });
+
+        sse.addEventListener('merging', (e) => {
+          const d = JSON.parse(e.data);
+          const pct = Math.round(((d.current - 1) / d.total) * 90);
+          updateTrayCard(cardId, pct,
+            `Merging ${d.current} / ${d.total}`,
+            `"${d.title}"`
+          );
+        });
+
+        sse.addEventListener('done', (e) => {
+          const d = JSON.parse(e.data);
+          zipCompleted = d.completed;
+          zipFailed = d.failed;
+          const pct = Math.round((d.current / d.total) * 90);
+          const status = d.failed > 0
+            ? `${d.completed} done, ${d.failed} failed`
+            : `${d.completed} / ${d.total} done`;
+          updateTrayCard(cardId, pct, `Done ${d.current} / ${d.total}`, status);
+        });
+
+        sse.addEventListener('failed', (e) => {
+          const d = JSON.parse(e.data);
+          zipCompleted = d.completed;
+          zipFailed = d.failed;
+          const pct = Math.round((d.current / d.total) * 90);
+          updateTrayCard(cardId, pct,
+            `Failed ${d.current} / ${d.total}`,
+            `${d.completed} done • ${d.failed} failed — "${d.title}"`
+          );
+        });
+
+        sse.addEventListener('complete', () => {
+          updateTrayCard(cardId, 92, 'Packing ZIP…', 'Finalising archive');
+        });
+
+        sse.addEventListener('error', (e) => {
+          try {
+            const d = JSON.parse(e.data);
+            console.warn('[SSE] server error:', d.error);
+          } catch {}
+        });
+
+        // Start the ZIP request (runs in parallel with SSE updates)
+        updateTrayCard(cardId, 1, 'Starting…', `0 / ${total}`);
         const res = await fetch(`${API_BASE}/api/download/playlist-zip`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url: currentVideo.url, formatId, ext }),
+          body: JSON.stringify({ url: currentVideo.url, formatId, ext, progressId }),
         });
 
         if (!res.ok) {
@@ -1456,11 +1530,10 @@
           throw new Error(err.error || `Server error ${res.status}`);
         }
 
-        updateTrayCard(cardId, 50, 'Receiving ZIP…', 'Downloading archive from server');
-
+        updateTrayCard(cardId, 93, 'Receiving ZIP…', 'Downloading archive to your device');
         const blob = await res.blob();
 
-        // Extract filename from Content-Disposition header if available
+        // Extract filename from Content-Disposition header
         let filename = playlistTitle + '.zip';
         const cd = res.headers.get('Content-Disposition') || '';
         const fnMatch = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';\r\n]+)/i);
@@ -1475,13 +1548,17 @@
         a.click();
         setTimeout(() => { URL.revokeObjectURL(objectUrl); a.remove(); }, 1000);
 
-        finishTrayCard(cardId, true, `${total} videos packed into ZIP`);
+        const summary = zipFailed > 0
+          ? `${zipCompleted} downloaded, ${zipFailed} failed`
+          : `${total} videos packed`;
+        finishTrayCard(cardId, true, summary);
         showToast(`Playlist ZIP ready: ${filename}`);
       } catch (err) {
         console.error('Playlist ZIP failed:', err);
         finishTrayCard(cardId, false, err.message || 'ZIP download failed');
         showToast(err.message || 'Playlist ZIP failed', 'error');
       } finally {
+        if (sse) sse.close();
         btn.disabled = false;
         btn.querySelector('span').textContent = getDefaultDownloadButtonLabel();
       }

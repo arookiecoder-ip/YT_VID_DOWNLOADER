@@ -1422,6 +1422,43 @@ async function streamDownload(req, res) {
   }
 }
 
+// In-memory SSE progress channels for playlist ZIP jobs.
+// Key: progressId (random hex), Value: { send(event, data), close() }
+const zipProgressChannels = new Map();
+
+// GET /api/download/playlist-zip/progress/:id — SSE stream for ZIP progress
+app.get("/api/download/playlist-zip/progress/:id", (req, res) => {
+  const id = String(req.params.id || "").trim();
+  if (!id || !/^[0-9a-f]{32}$/.test(id)) {
+    return res.status(400).end();
+  }
+
+  res.setHeader("Content-Type", "text/event-stream");
+  res.setHeader("Cache-Control", "no-cache");
+  res.setHeader("Connection", "keep-alive");
+  res.setHeader("X-Accel-Buffering", "no"); // disable Nginx buffering
+  res.flushHeaders();
+
+  const send = (event, data) => {
+    res.write("event: " + event + "\ndata: " + JSON.stringify(data) + "\n\n");
+    if (typeof res.flush === "function") res.flush();
+  };
+
+  zipProgressChannels.set(id, { send, close: () => res.end() });
+
+  req.on("close", () => {
+    zipProgressChannels.delete(id);
+  });
+
+  // Auto-cleanup after 30 min
+  setTimeout(() => {
+    if (zipProgressChannels.has(id)) {
+      zipProgressChannels.delete(id);
+      try { res.end(); } catch {}
+    }
+  }, 30 * 60 * 1000).unref();
+});
+
 // POST /api/download/playlist-zip — download all playlist videos and stream as a ZIP
 const playlistZipLimiter = rateLimit({
   windowMs: 10 * 60 * 1000,
@@ -1436,6 +1473,7 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
   const url = normalizeRequestUrl(source.url);
   const formatId = String(source.formatId || "best").trim();
   const ext = String(source.ext || "mp4").trim().toLowerCase();
+  const progressId = String(source.progressId || "").trim();
 
   if (!url || !isPlaylistURL(url)) {
     return res.status(400).json({ error: "Invalid or missing playlist URL" });
@@ -1443,9 +1481,20 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
 
   const isAudio = ext === "mp3" || formatId === "bestaudio";
 
-  // Fetch playlist entries
+  // Helper: send SSE event if a progress channel is registered
+  const emit = (event, data) => {
+    const ch = zipProgressChannels.get(progressId);
+    if (ch) ch.send(event, data);
+  };
+  const closeProgress = () => {
+    const ch = zipProgressChannels.get(progressId);
+    if (ch) { ch.close(); zipProgressChannels.delete(progressId); }
+  };
+
   let entries;
   try {
+    emit("status", { stage: "Fetching playlist info…", current: 0, total: 0 });
+
     const rawPlaylist = await runYtDlp([
       "--dump-single-json",
       "--flat-playlist",
@@ -1458,32 +1507,39 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
     const playlist = JSON.parse(rawPlaylist);
     entries = normalizePlaylistEntries(playlist.entries || []).slice(0, MAX_PLAYLIST_ENTRIES);
     if (!entries.length) {
+      closeProgress();
       return res.status(400).json({ error: "Playlist has no downloadable entries." });
     }
 
     const playlistTitle = sanitizeFilename(playlist.title || "Playlist");
     const outputExt = isAudio ? "mp3" : "mp4";
+    const total = entries.length;
+
+    emit("status", { stage: "Starting download…", current: 0, total });
 
     // Headers must be set before archiver starts writing
     res.setHeader("Content-Type", "application/zip");
     res.setHeader("Content-Disposition", buildContentDisposition(playlistTitle + ".zip"));
     res.setHeader("Cache-Control", "no-store");
 
-    const archive = archiver("zip", { zlib: { level: 0 } }); // level 0 = store, no re-compress
+    const archive = archiver("zip", { zlib: { level: 0 } });
     archive.on("warning", (err) => console.warn("[playlist-zip] archiver warning:", err.message));
     archive.on("error", (err) => {
       console.error("[playlist-zip] archiver error:", err.message);
-      // Headers already sent — can only destroy
       res.destroy(err);
     });
     archive.pipe(res);
+
+    let completed = 0;
+    let failed = 0;
 
     for (let i = 0; i < entries.length; i++) {
       const entry = entries[i];
       const title = sanitizeFilename(entry.title) || "video-" + (i + 1);
       const filename = title + "." + outputExt;
 
-      console.log("[playlist-zip] downloading", i + 1 + "/" + entries.length, title);
+      emit("downloading", { current: i + 1, total, title: entry.title || title });
+      console.log("[playlist-zip]", (i + 1) + "/" + total, title);
 
       try {
         await new Promise((resolve, reject) => {
@@ -1496,33 +1552,40 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
             const line = d.toString().trim();
             if (line) {
               stderrBuf += line + "\n";
-              console.log("[yt-dlp zip]", line);
+              // Forward merge/mux stage to frontend
+              if (/\[Merger\]|\[ffmpeg\]|Merging/i.test(line)) {
+                emit("merging", { current: i + 1, total, title: entry.title || title });
+              }
             }
           });
 
           archive.append(proc.stdout, { name: filename });
-
           proc.on("error", reject);
           proc.on("close", (code) => {
-            if (code !== 0) {
-              reject(new Error(stderrBuf.trim().slice(-300) || "yt-dlp exited with code " + code));
-            } else {
-              resolve();
-            }
+            if (code !== 0) reject(new Error(stderrBuf.trim().slice(-300) || "yt-dlp exited with code " + code));
+            else resolve();
           });
         });
+
+        completed++;
+        emit("done", { current: i + 1, total, title: entry.title || title, completed, failed });
       } catch (err) {
-        console.error("[playlist-zip] failed entry", entry.url, err.message);
-        // Append a small error text file in place of the failed video so the zip is still useful
+        failed++;
+        console.error("[playlist-zip] failed:", entry.url, err.message);
         archive.append("Download failed: " + err.message.slice(0, 300), {
           name: "FAILED - " + sanitizeFilename(entry.title || "video-" + (i + 1)) + ".txt",
         });
+        emit("failed", { current: i + 1, total, title: entry.title || title, completed, failed, error: err.message.slice(0, 200) });
       }
     }
 
     await archive.finalize();
+    emit("complete", { total, completed, failed });
+    closeProgress();
   } catch (err) {
     console.error("[playlist-zip]", err.message);
+    emit("error", { error: err.message.slice(0, 300) });
+    closeProgress();
     if (!res.headersSent) {
       return res.status(500).json({ error: "Playlist ZIP failed: " + err.message.slice(0, 300) });
     }

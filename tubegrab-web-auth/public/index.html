@@ -1531,7 +1531,6 @@
         }
 
         updateTrayCard(cardId, 93, 'Receiving ZIP…', 'Downloading archive to your device');
-        const blob = await res.blob();
 
         // Extract filename from Content-Disposition header
         let filename = playlistTitle + '.zip';
@@ -1539,14 +1538,33 @@
         const fnMatch = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';\r\n]+)/i);
         if (fnMatch) filename = decodeURIComponent(fnMatch[1].trim().replace(/^["']|["']$/g, ''));
 
-        // Trigger browser download
-        const objectUrl = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = objectUrl;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        setTimeout(() => { URL.revokeObjectURL(objectUrl); a.remove(); }, 1000);
+        // Stream directly to disk (Chrome/Edge) — avoids buffering entire ZIP in RAM.
+        // Falls back to blob for Firefox/Safari which lack showSaveFilePicker.
+        if (window.showSaveFilePicker) {
+          let fileHandle;
+          try {
+            fileHandle = await window.showSaveFilePicker({
+              suggestedName: filename,
+              types: [{ description: 'ZIP archive', accept: { 'application/zip': ['.zip'] } }],
+            });
+          } catch (pickerErr) {
+            // User cancelled the save dialog — abort cleanly
+            if (pickerErr.name === 'AbortError') throw new Error('Save cancelled');
+            throw pickerErr;
+          }
+          const writable = await fileHandle.createWritable();
+          await res.body.pipeTo(writable); // streams chunk-by-chunk, zero RAM accumulation
+        } else {
+          // Fallback: buffer as blob then trigger anchor download
+          const blob = await res.blob();
+          const objectUrl = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = objectUrl;
+          a.download = filename;
+          document.body.appendChild(a);
+          a.click();
+          setTimeout(() => { URL.revokeObjectURL(objectUrl); a.remove(); }, 1000);
+        }
 
         const summary = zipFailed > 0
           ? `${zipCompleted} downloaded, ${zipFailed} failed`

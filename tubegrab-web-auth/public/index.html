@@ -716,6 +716,7 @@
       font-weight: 600;
       line-height: 1.35;
       display: -webkit-box;
+      line-clamp: 2;
       -webkit-line-clamp: 2;
       -webkit-box-orient: vertical;
       overflow: hidden;
@@ -1254,11 +1255,11 @@
       return 'Download';
     }
 
-    function queueIframeDownload(params, onSettled) {
+    function queueIframeDownloadByUrl(url, onSettled) {
       const iframe = document.createElement('iframe');
       iframe.style.display = 'none';
       iframe.name = 'downloadFrame' + Date.now() + '_' + (downloadFrameCounter++);
-      iframe.src = `${API_BASE}/api/download?${params.toString()}`;
+      iframe.src = url;
       document.body.appendChild(iframe);
       let settled = false;
       const settle = () => {
@@ -1268,6 +1269,85 @@
       };
       iframe.addEventListener('load', () => setTimeout(settle, 2000));
       setTimeout(() => { settle(); iframe.remove(); }, 120000);
+    }
+
+    function queueIframeDownload(params, onSettled) {
+      queueIframeDownloadByUrl(`${API_BASE}/api/download?${params.toString()}`, onSettled);
+    }
+
+    function queueIframeFileDownload(token, onSettled) {
+      queueIframeDownloadByUrl(`${API_BASE}/api/download/file/${encodeURIComponent(token)}`, onSettled);
+    }
+
+    function delay(ms) {
+      return new Promise(resolve => setTimeout(resolve, ms));
+    }
+
+    async function waitForDownloadReady(token) {
+      const startedAt = Date.now();
+      const timeoutMs = 30 * 60 * 1000;
+      let consecutiveFailures = 0;
+
+      while (Date.now() - startedAt <= timeoutMs) {
+        try {
+          const statusRes = await fetch(`${API_BASE}/api/download/status/${encodeURIComponent(token)}`);
+          if (!statusRes.ok) {
+            const errData = await statusRes.json().catch(() => ({}));
+            throw new Error(errData.error || `Status check failed (${statusRes.status})`);
+          }
+
+          const status = await statusRes.json();
+          if (status.state === 'done') return status;
+          if (status.state === 'error') {
+            throw new Error(status.error || 'Download failed on server');
+          }
+
+          consecutiveFailures = 0;
+        } catch (err) {
+          consecutiveFailures += 1;
+          if (consecutiveFailures >= 5) {
+            throw err;
+          }
+        }
+
+        await delay(3000);
+      }
+
+      throw new Error('Download timed out after 30 minutes.');
+    }
+
+    async function startDownloadJobWithRetry(url, formatId, ext, onRetry) {
+      const startedAt = Date.now();
+      const timeoutMs = 20 * 60 * 1000;
+
+      while (Date.now() - startedAt <= timeoutMs) {
+        const startRes = await fetch(`${API_BASE}/api/download/start`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            url,
+            formatId,
+            ext,
+          }),
+        });
+
+        if (startRes.ok) {
+          return startRes.json();
+        }
+
+        const errData = await startRes.json().catch(() => ({}));
+        const message = errData.error || `Server error ${startRes.status}`;
+        if (startRes.status !== 429) {
+          throw new Error(message);
+        }
+
+        const retryAfter = Number(startRes.headers.get('Retry-After') || 0);
+        const waitMs = retryAfter > 0 ? retryAfter * 1000 : 3000;
+        if (typeof onRetry === 'function') onRetry(message, waitMs);
+        await delay(Math.max(1000, Math.min(waitMs, 10000)));
+      }
+
+      throw new Error('Timed out waiting for available server capacity.');
     }
 
     // ── Downloads Tray ──
@@ -1362,6 +1442,37 @@
       const btn = document.getElementById('downloadBtn');
       const playlistTitle = currentVideo.title || 'Playlist';
       const cardId = createTrayCard(playlistTitle, `${entries.length} videos`);
+      const total = entries.length;
+      let started = 0;
+      let delivered = 0;
+      let failed = 0;
+      let finalized = false;
+
+      const maybeFinalize = () => {
+        if (finalized) return;
+        const settled = delivered + failed;
+        if (settled < total) return;
+        finalized = true;
+        if (failed > 0) {
+          finishTrayCard(cardId, false, `${delivered} completed • ${failed} failed`);
+          showToast(`Playlist done with errors (${delivered}/${total} completed).`, 'error');
+        } else {
+          finishTrayCard(cardId, true, `${delivered} completed`);
+          showToast(`Playlist complete: ${delivered} videos downloaded.`);
+        }
+      };
+
+      const updateSummary = (label) => {
+        const settled = delivered + failed;
+        const pct = total > 0 ? Math.round((settled / total) * 100) : 0;
+        updateTrayCard(
+          cardId,
+          pct,
+          label || `Processed ${settled} / ${total}`,
+          `${started} started • ${delivered} completed • ${failed} failed`
+        );
+        maybeFinalize();
+      };
 
       btn.disabled = true;
       btn.querySelector('span').textContent = 'Queueing…';
@@ -1369,25 +1480,54 @@
 
       for (let i = 0; i < entries.length; i += 1) {
         const item = entries[i];
-        const params = new URLSearchParams({
-          url: item.url,
-          formatId,
-          ext,
-        });
-        queueIframeDownload(params);
+        try {
+          const { token } = await startDownloadJobWithRetry(
+            item.url,
+            formatId,
+            ext,
+            () => {
+              updateSummary('Waiting for available server slot…');
+            },
+          );
+          started += 1;
+          updateSummary(`Queued ${started} / ${total}`);
 
-        const pct = Math.round(((i + 1) / entries.length) * 100);
-        updateTrayCard(cardId, pct, `Queued ${i + 1} / ${entries.length}`, '');
+          (async () => {
+            try {
+              await waitForDownloadReady(token);
+              activeDownloads += 1;
+              queueIframeFileDownload(token, () => {
+                activeDownloads = Math.max(0, activeDownloads - 1);
+                delivered += 1;
+                updateSummary();
+              });
+            } catch (err) {
+              failed += 1;
+              console.warn(`Playlist item failed (${item.url}):`, err);
+              updateSummary();
+            }
+          })();
+        } catch (err) {
+          failed += 1;
+          console.warn(`Failed to queue playlist item (${item.url}):`, err);
+          updateSummary();
+        }
 
         if (i < entries.length - 1) {
-          await new Promise(resolve => setTimeout(resolve, 180));
+          await delay(180);
         }
       }
 
       btn.disabled = false;
       btn.querySelector('span').textContent = getDefaultDownloadButtonLabel();
-      finishTrayCard(cardId, true, `${entries.length} videos queued`);
-      showToast(`Queued ${entries.length} videos. Allow multiple downloads if prompted.`);
+
+      if (started === 0) {
+        finishTrayCard(cardId, false, 'No items were queued');
+        showToast('Unable to queue playlist downloads.', 'error');
+        return;
+      }
+
+      updateSummary('Waiting for server jobs…');
     }
 
     function showToast(msg, type = 'success') {

@@ -10,6 +10,13 @@ const fs = require("fs");
 require("dotenv").config();
 
 const app = express();
+
+function parsePositiveEnvInt(value, fallback) {
+  const parsed = Number.parseInt(String(value || "").trim(), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
+}
+
+const NODE_ENV = process.env.NODE_ENV || "development";
 const PORT = process.env.PORT || 3000;
 const YT_DLP = process.env.YT_DLP_PATH || "yt-dlp";
 const YTDLP_COOKIES = process.env.YTDLP_COOKIES || "";
@@ -17,34 +24,27 @@ const AUTH_USERNAME = process.env.AUTH_USERNAME || "admin";
 const AUTH_PASSWORD = process.env.AUTH_PASSWORD || "change-me-now";
 const AUTH_REALM = process.env.AUTH_REALM || "TubeGrab Protected";
 const TRUST_PROXY = process.env.TRUST_PROXY || "";
-const AUTH_MAX_FAILURES = Number.parseInt(
-  process.env.AUTH_MAX_FAILURES || "10",
-  10,
+const AUTH_MAX_FAILURES = parsePositiveEnvInt(process.env.AUTH_MAX_FAILURES, 10);
+const AUTH_BLOCK_MINUTES = parsePositiveEnvInt(process.env.AUTH_BLOCK_MINUTES, 15);
+const GLOBAL_RATE_LIMIT_WINDOW_MS = parsePositiveEnvInt(
+  process.env.GLOBAL_RATE_LIMIT_WINDOW_MS,
+  60000,
 );
-const AUTH_BLOCK_MINUTES = Number.parseInt(
-  process.env.AUTH_BLOCK_MINUTES || "15",
-  10,
+const GLOBAL_RATE_LIMIT_MAX = parsePositiveEnvInt(
+  process.env.GLOBAL_RATE_LIMIT_MAX,
+  120,
 );
-const GLOBAL_RATE_LIMIT_WINDOW_MS = Number.parseInt(
-  process.env.GLOBAL_RATE_LIMIT_WINDOW_MS || "60000",
-  10,
+const DOWNLOAD_RATE_LIMIT_MAX = parsePositiveEnvInt(
+  process.env.DOWNLOAD_RATE_LIMIT_MAX,
+  8,
 );
-const GLOBAL_RATE_LIMIT_MAX = Number.parseInt(
-  process.env.GLOBAL_RATE_LIMIT_MAX || "120",
-  10,
+const DOWNLOAD_START_RATE_LIMIT_MAX = parsePositiveEnvInt(
+  process.env.DOWNLOAD_START_RATE_LIMIT_MAX,
+  60,
 );
-const DOWNLOAD_RATE_LIMIT_MAX = Number.parseInt(
-  process.env.DOWNLOAD_RATE_LIMIT_MAX || "8",
-  10,
-);
-const MAX_PLAYLIST_ENTRIES = Number.parseInt(
-  process.env.MAX_PLAYLIST_ENTRIES || "50",
-  10,
-);
-const MAX_CONCURRENT_JOBS = Number.parseInt(
-  process.env.MAX_CONCURRENT_JOBS || "25",
-  10,
-);
+const MAX_PLAYLIST_ENTRIES = parsePositiveEnvInt(process.env.MAX_PLAYLIST_ENTRIES, 50);
+const MAX_CONCURRENT_JOBS = parsePositiveEnvInt(process.env.MAX_CONCURRENT_JOBS, 25);
+const MAX_INPUT_URL_LENGTH = 2048;
 const DOWNLOAD_WATCHDOG_MS = 180000;
 const DOWNLOAD_WATCHDOG_TICK_MS = 15000;
 const IFRAME_LIFETIME_MS = 120000;
@@ -54,10 +54,26 @@ const PROGRESS_RANGE = 70;
 const authFailuresByIp = new Map();
 
 if (TRUST_PROXY) {
-  app.set("trust proxy", TRUST_PROXY === "true" ? 1 : TRUST_PROXY);
+  const normalizedTrustProxy = String(TRUST_PROXY).trim().toLowerCase();
+  if (normalizedTrustProxy === "true" || normalizedTrustProxy === "1") {
+    app.set("trust proxy", 1);
+  } else if (normalizedTrustProxy === "false" || normalizedTrustProxy === "0") {
+    app.set("trust proxy", false);
+  } else {
+    app.set("trust proxy", TRUST_PROXY);
+  }
 }
 
-if (AUTH_USERNAME === "admin" && AUTH_PASSWORD === "change-me-now") {
+if (NODE_ENV === "production") {
+  if (!process.env.AUTH_USERNAME || !process.env.AUTH_PASSWORD) {
+    throw new Error(
+      "[auth] AUTH_USERNAME and AUTH_PASSWORD must be explicitly set in production.",
+    );
+  }
+  if (AUTH_USERNAME === "admin" && AUTH_PASSWORD === "change-me-now") {
+    throw new Error("[auth] Default credentials are not allowed in production.");
+  }
+} else if (AUTH_USERNAME === "admin" && AUTH_PASSWORD === "change-me-now") {
   console.warn(
     "[auth] Using default credentials. Set AUTH_USERNAME and AUTH_PASSWORD for production.",
   );
@@ -76,11 +92,8 @@ function sendAuthChallenge(res) {
 }
 
 function getClientId(req) {
-  const xff = String(req.headers["x-forwarded-for"] || "")
-    .split(",")
-    .map((part) => part.trim())
-    .find(Boolean);
-  return xff || req.ip || req.socket.remoteAddress || "unknown";
+  const candidate = req.ip || req.socket?.remoteAddress || "";
+  return String(candidate).trim() || "unknown";
 }
 
 function getBlockedUntil(clientId) {
@@ -122,7 +135,7 @@ function clearAuthFailures(clientId) {
   authFailuresByIp.delete(clientId);
 }
 
-setInterval(
+const authFailureSweepTimer = setInterval(
   () => {
     const now = Date.now();
     for (const [ip, state] of authFailuresByIp.entries()) {
@@ -134,6 +147,9 @@ setInterval(
   },
   10 * 60 * 1000,
 );
+if (typeof authFailureSweepTimer.unref === "function") {
+  authFailureSweepTimer.unref();
+}
 
 const globalLimiter = rateLimit({
   windowMs: GLOBAL_RATE_LIMIT_WINDOW_MS,
@@ -143,12 +159,20 @@ const globalLimiter = rateLimit({
   message: { error: "Too many requests. Try again shortly." },
 });
 
-const downloadLimiter = rateLimit({
+const directDownloadLimiter = rateLimit({
   windowMs: 60 * 1000,
   max: DOWNLOAD_RATE_LIMIT_MAX,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: "Too many download requests. Wait and retry." },
+});
+
+const downloadStartLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: DOWNLOAD_START_RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many queued jobs. Wait and retry." },
 });
 
 function basicAuthMiddleware(req, res, next) {
@@ -295,6 +319,12 @@ function isPlaylistURL(url) {
   if (!info) return false;
   if (info.isPlaylistPath && info.listId) return true;
   return Boolean(info.listId) && !info.videoId;
+}
+
+function normalizeRequestUrl(raw) {
+  const normalized = String(raw || "").trim();
+  if (!normalized || normalized.length > MAX_INPUT_URL_LENGTH) return null;
+  return normalized;
 }
 
 function withCookies(args) {
@@ -665,7 +695,7 @@ function buildDownloadArgs(formatId, isAudio, outputTarget = "-") {
 
 // GET /api/info
 app.get("/api/info", async (req, res) => {
-  const url = String(req.query.url || "").trim();
+  const url = normalizeRequestUrl(req.query.url);
   const parsed = parseYouTubeURL(url);
   if (!parsed) {
     return res.status(400).json({ error: "Invalid or missing YouTube URL" });
@@ -756,7 +786,7 @@ app.get("/api/info", async (req, res) => {
 
 // GET /api/download-meta
 app.get("/api/download-meta", async (req, res) => {
-  const url = String(req.query.url || "").trim();
+  const url = normalizeRequestUrl(req.query.url);
   const formatId = String(req.query.formatId || "best").trim();
   const ext = String(req.query.ext || "mp4")
     .trim()
@@ -819,12 +849,15 @@ function cleanupJob(token) {
 }
 
 // Sweep expired jobs.
-setInterval(() => {
+const jobSweepTimer = setInterval(() => {
   const now = Date.now();
   for (const [token, job] of jobs.entries()) {
     if (now - job.createdAt > JOB_TTL_MS) cleanupJob(token);
   }
 }, JOB_SWEEP_INTERVAL_MS);
+if (typeof jobSweepTimer.unref === "function") {
+  jobSweepTimer.unref();
+}
 
 function performDownload(url, formatId, isAudio, { onProgress, onStage } = {}) {
   const outputExt = isAudio ? "mp3" : "mp4";
@@ -1028,9 +1061,9 @@ async function runDownloadJob(token, url, formatId, isAudio) {
 }
 
 // POST /api/download/start — kick off background job, return token immediately
-app.post("/api/download/start", downloadLimiter, (req, res) => {
+app.post("/api/download/start", downloadStartLimiter, (req, res) => {
   const source = req.body || {};
-  const url = String(source.url || "").trim();
+  const url = normalizeRequestUrl(source.url);
   const formatId = String(source.formatId || "best").trim();
   const ext = String(source.ext || "mp4").trim().toLowerCase();
 
@@ -1111,7 +1144,7 @@ app.get("/api/download/file/:token", (req, res) => {
 async function streamDownload(req, res) {
   const source =
     req.method === "GET" || req.method === "HEAD" ? req.query : req.body || {};
-  const url = String(source.url || "").trim();
+  const url = normalizeRequestUrl(source.url);
   const formatId = String(source.formatId || "best").trim();
   const ext = String(source.ext || "mp4").trim().toLowerCase();
 
@@ -1167,13 +1200,13 @@ async function streamDownload(req, res) {
 }
 
 // GET /api/download — legacy direct stream (used by playlist iframe fallback)
-app.use("/api/download", downloadLimiter);
+app.use("/api/download", directDownloadLimiter);
 app.get("/api/download", streamDownload);
 app.post("/api/download", streamDownload);
 
 // GET /api/formats
 app.get("/api/formats", async (req, res) => {
-  const { url } = req.query;
+  const url = normalizeRequestUrl(req.query.url);
   if (!url || !isValidYouTubeURL(url)) {
     return res.status(400).json({ error: "Invalid YouTube URL" });
   }
@@ -1222,6 +1255,23 @@ app.get("/{*splat}", (req, res) => {
   res.sendFile(path.join(__dirname, "public", "index.html"));
 });
 
-app.listen(PORT, () => {
-  console.log("\n  TubeGrab running at http://localhost:" + PORT + "\n");
-});
+function startServer(port = PORT) {
+  return app.listen(port, () => {
+    console.log("\n  TubeGrab running at http://localhost:" + port + "\n");
+  });
+}
+
+if (require.main === module) {
+  startServer();
+}
+
+module.exports = {
+  app,
+  startServer,
+  parsePositiveEnvInt,
+  parseYouTubeURL,
+  isPlaylistURL,
+  normalizeRequestUrl,
+  getClientId,
+  MAX_INPUT_URL_LENGTH,
+};

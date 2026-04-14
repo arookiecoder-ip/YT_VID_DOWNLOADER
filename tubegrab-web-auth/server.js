@@ -362,10 +362,16 @@ function withCookies(args) {
 }
 
 function runYtDlp(args) {
+  // Prepend extractor args so yt-dlp uses the web player client,
+  // which avoids the n-challenge JS solver requirement on headless servers.
+  const baseArgs = [
+    "--extractor-args", "youtube:player_client=web,default",
+    ...withCookies(args),
+  ];
   return new Promise((resolve, reject) => {
     execFile(
       YT_DLP,
-      withCookies(args),
+      baseArgs,
       { timeout: 90000, maxBuffer: 20 * 1024 * 1024 },
       (err, stdout, stderr) => {
         if (err) {

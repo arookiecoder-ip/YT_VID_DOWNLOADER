@@ -1,10 +1,14 @@
 FROM node:20-slim
 
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ca-certificates python3 ffmpeg curl && \
+    apt-get install -y --no-install-recommends ca-certificates python3 python3-mutagen ffmpeg curl && \
     curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && \
     chmod a+rx /usr/local/bin/yt-dlp && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# yt-dlp needs a JS runtime to solve YouTube's n-challenge (throttle bypass).
+# Node.js is already available in this image — symlink it where yt-dlp looks.
+RUN ln -sf /usr/local/bin/node /usr/bin/node
 
 WORKDIR /app
 COPY package*.json ./

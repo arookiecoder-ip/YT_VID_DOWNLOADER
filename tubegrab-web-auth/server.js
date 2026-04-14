@@ -810,13 +810,22 @@ app.get("/api/info", async (req, res) => {
     });
   } catch (err) {
     console.error("[/api/info]", err.message);
-    const generic = "Failed to fetch video info. It may be restricted or unavailable.";
+    const rawMsg = String(err.message || "").trim();
+
+    // Extract the most useful line from yt-dlp stderr output.
+    // yt-dlp often emits multi-line stderr; the last non-empty line is the real error.
+    const usefulLine = rawMsg
+      .split(/\r?\n/)
+      .map((l) => l.replace(/^ERROR:\s*/i, "").trim())
+      .filter(Boolean)
+      .pop() || "Unknown error from yt-dlp";
+
+    const detail = usefulLine.slice(0, 300);
+
     if (DEBUG_API_ERRORS) {
-      return res.status(500).json({
-        error: generic + " Details: " + String(err.message || "unknown").slice(0, 220),
-      });
+      return res.status(500).json({ error: detail, debug: rawMsg.slice(0, 500) });
     }
-    res.status(500).json({ error: generic });
+    res.status(500).json({ error: detail });
   }
 });
 

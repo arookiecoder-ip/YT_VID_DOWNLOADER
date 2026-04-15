@@ -273,6 +273,99 @@
       font-size: 0.78rem;
     }
 
+    .batch-toggle {
+      display: block;
+      text-align: center;
+      margin-top: 10px;
+      color: var(--text-dimmer);
+      font-size: 0.78rem;
+      background: none;
+      border: none;
+      cursor: pointer;
+      padding: 2px 6px;
+      border-radius: 6px;
+      transition: color 0.2s;
+    }
+    .batch-toggle:hover { color: var(--accent); }
+
+    .batch-section {
+      margin-top: 14px;
+      animation: fadeSlideUp 0.3s ease-out;
+    }
+    .batch-section[hidden] { display: none; }
+
+    .batch-box {
+      background: var(--surface);
+      border: 1.5px solid var(--border);
+      border-radius: var(--radius);
+      padding: 14px;
+      transition: border-color 0.3s, box-shadow 0.3s;
+    }
+    .batch-box:focus-within {
+      border-color: var(--accent-3);
+      box-shadow: 0 0 0 4px rgba(204,51,255,0.08), 0 8px 24px rgba(0,0,0,0.3);
+    }
+
+    .batch-textarea {
+      width: 100%;
+      min-height: 110px;
+      background: transparent;
+      border: none;
+      outline: none;
+      resize: vertical;
+      color: var(--text);
+      font-family: var(--mono);
+      font-size: 0.82rem;
+      line-height: 1.6;
+      padding: 4px 2px;
+    }
+    .batch-textarea::placeholder {
+      color: var(--text-dimmer);
+      font-family: var(--font);
+      font-size: 0.82rem;
+    }
+
+    .batch-footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      margin-top: 10px;
+      gap: 10px;
+    }
+    .batch-hint {
+      color: var(--text-dimmer);
+      font-size: 0.75rem;
+      flex: 1;
+    }
+    .batch-hint span {
+      color: var(--accent-3);
+      font-weight: 600;
+    }
+
+    .btn-batch {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 10px 22px;
+      background: linear-gradient(135deg, var(--accent-3), #a020cc);
+      color: #fff;
+      border: none;
+      border-radius: var(--radius-sm);
+      font-family: var(--font);
+      font-weight: 600;
+      font-size: 0.88rem;
+      cursor: pointer;
+      white-space: nowrap;
+      transition: transform 0.15s, box-shadow 0.2s, opacity 0.2s;
+    }
+    .btn-batch:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 6px 20px rgba(204,51,255,0.35);
+    }
+    .btn-batch:active { transform: translateY(0); }
+    .btn-batch:disabled { opacity: 0.5; cursor: not-allowed; transform: none; }
+    .btn-batch svg { width: 16px; height: 16px; fill: currentColor; }
+
     .loader-wrap {
       display: none;
       flex-direction: column;
@@ -986,6 +1079,21 @@
         </button>
       </div>
       <p class="hint">Supports videos, shorts, and playlist links</p>
+      <button class="batch-toggle" id="batchToggle" onclick="toggleBatch()">＋ Batch download multiple links</button>
+      <div class="batch-section" id="batchSection" hidden>
+        <div class="batch-box">
+          <textarea class="batch-textarea" id="batchInput"
+            placeholder="Paste any text here — YouTube links will be extracted automatically.&#10;&#10;e.g.&#10;Check out https://youtu.be/dQw4w9WgXcQ and also https://www.youtube.com/watch?v=abc123&#10;More links mixed in text are fine too."
+            spellcheck="false"></textarea>
+          <div class="batch-footer">
+            <div class="batch-hint" id="batchHint">Paste text containing YouTube URLs</div>
+            <button class="btn-batch" id="batchBtn" onclick="startBatchDownload()">
+              <svg viewBox="0 0 24 24"><path d="M19 9h-4V3H9v6H5l7 7 7-7zM5 18v2h14v-2H5z"/></svg>
+              <span>Download All</span>
+            </button>
+          </div>
+        </div>
+      </div>
     </section>
 
     <div class="features" id="featuresGrid">
@@ -1794,6 +1902,139 @@
     function showResult(s) {
       document.getElementById('resultCard').classList.toggle('active', s);
       if (s) document.getElementById('featuresGrid').style.display = 'none';
+    }
+
+    // ── Batch Download ──
+
+    function toggleBatch() {
+      const sec = document.getElementById('batchSection');
+      const btn = document.getElementById('batchToggle');
+      const hidden = sec.hasAttribute('hidden');
+      if (hidden) {
+        sec.removeAttribute('hidden');
+        btn.textContent = '− Hide batch downloader';
+        document.getElementById('batchInput').focus();
+      } else {
+        sec.setAttribute('hidden', '');
+        btn.textContent = '＋ Batch download multiple links';
+      }
+    }
+
+    function extractYouTubeURLs(text) {
+      // Match all http(s) URLs in the text, then filter to valid YT ones
+      const urlRe = /https?:\/\/[^\s"'<>]+/g;
+      const seen = new Set();
+      const out = [];
+      for (const raw of (text.match(urlRe) || [])) {
+        // strip trailing punctuation that's unlikely part of URL
+        const clean = raw.replace(/[.,;:!?)]+$/, '');
+        if (seen.has(clean)) continue;
+        if (!isValidYouTubeURL(clean)) continue;
+        if (isPlaylistURL(clean)) continue; // skip playlists — use playlist tab for those
+        seen.add(clean);
+        out.push(clean);
+      }
+      return out;
+    }
+
+    // Live hint: count URLs as user types
+    document.addEventListener('DOMContentLoaded', () => {
+      const ta = document.getElementById('batchInput');
+      if (ta) ta.addEventListener('input', updateBatchHint);
+    });
+    // Also wire up after parse since DOMContentLoaded may have already fired
+    (function () {
+      const ta = document.getElementById('batchInput');
+      if (ta) ta.addEventListener('input', updateBatchHint);
+    })();
+
+    function updateBatchHint() {
+      const text = document.getElementById('batchInput').value;
+      const urls = extractYouTubeURLs(text);
+      const hint = document.getElementById('batchHint');
+      if (!text.trim()) {
+        hint.innerHTML = 'Paste text containing YouTube URLs';
+      } else if (urls.length === 0) {
+        hint.innerHTML = 'No YouTube video links found';
+      } else {
+        hint.innerHTML = `<span>${urls.length}</span> link${urls.length > 1 ? 's' : ''} found — downloads go to browser Downloads bar`;
+      }
+    }
+
+    async function startBatchDownload() {
+      const text = document.getElementById('batchInput').value;
+      const urls = extractYouTubeURLs(text);
+
+      if (urls.length === 0) {
+        showToast('No YouTube video links found in the pasted text', 'error');
+        return;
+      }
+
+      const btn = document.getElementById('batchBtn');
+      btn.disabled = true;
+
+      showToast(`Starting ${urls.length} download${urls.length > 1 ? 's' : ''}…`);
+
+      // Queue all concurrently — each gets its own tray card
+      await Promise.allSettled(urls.map((url, i) => startBatchItem(url, i + 1, urls.length)));
+
+      btn.disabled = false;
+    }
+
+    async function startBatchItem(url, index, total) {
+      // Create tray card immediately with placeholder title
+      const shortLabel = `Video ${index}${total > 1 ? ' of ' + total : ''}`;
+      const cardId = createTrayCard(shortLabel, url.slice(0, 48) + (url.length > 48 ? '…' : ''));
+      activeDownloads++;
+
+      try {
+        // Fetch video info to get real title and best format
+        const res = await fetch(`${API_BASE}/api/info?url=${encodeURIComponent(url)}`);
+        const data = await res.json();
+        if (!res.ok) throw new Error(data.error || 'Failed to fetch info');
+
+        // Skip playlists (shouldn't reach here but guard anyway)
+        if (data.kind === 'playlist') {
+          finishTrayCard(cardId, false, 'Skipped — playlist link');
+          activeDownloads = Math.max(0, activeDownloads - 1);
+          return;
+        }
+
+        // Pick best video format (first format = best quality by server ordering)
+        const bestFmt = data.formats && data.formats[0];
+        const formatId = bestFmt ? bestFmt.id : 'best';
+        const ext = bestFmt ? (bestFmt.ext || 'mp4') : 'mp4';
+        const title = data.title || shortLabel;
+        const suggestedFilename = `${sanitizeClientFilename(title)}.${ext}`;
+
+        // Update card with real title
+        const titleEl = document.querySelector(`#${cardId} .dl-card-title`);
+        if (titleEl) titleEl.textContent = title;
+        const sizeEl = document.getElementById(`${cardId}-size`);
+        if (sizeEl) sizeEl.textContent = suggestedFilename;
+
+        updateTrayCard(cardId, 10, 'Queueing on server…', suggestedFilename);
+
+        // Start the job on the server
+        const job = await startDownloadJobWithRetry(url, formatId, ext, (msg, waitMs) => {
+          updateTrayCard(cardId, 5, `Rate limited — retrying in ${Math.round(waitMs / 1000)}s…`, suggestedFilename);
+        });
+
+        updateTrayCard(cardId, 20, 'Downloading to server…', suggestedFilename);
+
+        // Use iframe download — batch can't use showSaveFilePicker (requires individual gestures)
+        const params = new URLSearchParams({ url, formatId, ext });
+        queueIframeDownload(params, () => {
+          activeDownloads = Math.max(0, activeDownloads - 1);
+        });
+
+        finishTrayCard(cardId, true, 'Check your Downloads bar');
+        updateTrayCard(cardId, 100, 'Sent to browser', 'Check your Downloads bar');
+
+      } catch (err) {
+        activeDownloads = Math.max(0, activeDownloads - 1);
+        finishTrayCard(cardId, false, err.message || 'Failed');
+      }
     }
 
     document.getElementById('urlInput').addEventListener('keydown', e => {

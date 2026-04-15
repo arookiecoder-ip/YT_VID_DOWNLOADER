@@ -56,7 +56,7 @@ const DOWNLOAD_START_RATE_LIMIT_MAX = parsePositiveEnvInt(
   process.env.DOWNLOAD_START_RATE_LIMIT_MAX,
   60,
 );
-const MAX_PLAYLIST_ENTRIES = parsePositiveEnvInt(process.env.MAX_PLAYLIST_ENTRIES, 50);
+const MAX_PLAYLIST_ENTRIES = parsePositiveEnvInt(process.env.MAX_PLAYLIST_ENTRIES, 500);
 const MAX_CONCURRENT_JOBS = parsePositiveEnvInt(process.env.MAX_CONCURRENT_JOBS, 25);
 // Max parallel yt-dlp processes per playlist ZIP (higher = faster but more RAM/CPU)
 const PLAYLIST_CONCURRENCY = parsePositiveEnvInt(process.env.PLAYLIST_CONCURRENCY, 3);

@@ -26,9 +26,16 @@ temp/
 
 # Build/test artifacts
 dist/
+dist2/
 build/
 coverage/
 .nyc_output/
+
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
 
 # Cache
 .cache/
@@ -44,6 +51,9 @@ Thumbs.db
 .idea/
 *.swp
 *.swo
+
+# Local tooling settings
+.claude/
 
 # Docker local overrides
 docker-compose.override.yml

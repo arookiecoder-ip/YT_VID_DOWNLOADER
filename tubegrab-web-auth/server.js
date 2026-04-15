@@ -1593,9 +1593,33 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
     // A mutex (archiveLock) ensures only one video is being appended to the archive at a time.
     let archiveLock = Promise.resolve();
 
-    // Download a single entry to a temp file and resolve with { tempPath, filename, entry, index }
-    const downloadEntry = (entry, i) => new Promise((resolve, reject) => {
-      if (aborted) return reject(new Error("cancelled"));
+    // Download a single entry to a temp file.
+    // Returns { downloadDone, mergeDone }
+    //   downloadDone — resolves (void) when the yt-dlp download phase ends.
+    //                  For merge formats: resolves when [Merger] appears in stderr.
+    //                  For non-merge:    resolves at proc close (same tick as mergeDone).
+    //   mergeDone    — resolves with { tempPath, filename, entry, index } at proc close.
+    const downloadEntry = (entry, i) => {
+      let downloadDoneResolve, downloadDoneReject;
+      const downloadDone = new Promise((res, rej) => {
+        downloadDoneResolve = res;
+        downloadDoneReject = rej;
+      });
+
+      let mergeDoneResolve, mergeDoneReject;
+      const mergeDone = new Promise((res, rej) => {
+        mergeDoneResolve = res;
+        mergeDoneReject = rej;
+      });
+      // Suppress unhandled-rejection warnings — the caller awaits mergeDone explicitly
+      mergeDone.catch(() => {});
+
+      if (aborted) {
+        const err = new Error("cancelled");
+        downloadDoneReject(err);
+        mergeDoneReject(err);
+        return { downloadDone, mergeDone };
+      }
 
       const title = sanitizeFilename(entry.title) || "video-" + (i + 1);
       const filename = title + "." + outputExt;
@@ -1612,12 +1636,16 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
       activeProcs.add(proc);
 
       let stderrBuf = "";
+      let mergeStarted = false;
+
       proc.stderr.on("data", (d) => {
         const line = d.toString().trim();
         if (line) {
           stderrBuf += line + "\n";
-          if (/\[Merger\]|\[ffmpeg\]|Merging/i.test(line)) {
+          if (needsMerge && !mergeStarted && /\[Merger\]|\[ffmpeg\]|Merging/i.test(line)) {
+            mergeStarted = true;
             emit("merging", { current: i + 1, total, title: entry.title || title });
+            downloadDoneResolve(); // network done — release semaphore slot now
           }
         }
       });
@@ -1627,20 +1655,41 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
         // don't interleave — each finishes independently then gets appended in order
         const writeStream = fs.createWriteStream(tempPath);
         proc.stdout.pipe(writeStream);
-        writeStream.on("error", reject);
+        writeStream.on("error", (err) => {
+          downloadDoneReject(err);
+          mergeDoneReject(err);
+        });
       }
 
-      proc.on("error", (err) => { activeProcs.delete(proc); reject(err); });
+      proc.on("error", (err) => {
+        activeProcs.delete(proc);
+        downloadDoneReject(err);
+        mergeDoneReject(err);
+      });
+
       proc.on("close", (code) => {
         activeProcs.delete(proc);
-        if (aborted) return reject(new Error("cancelled"));
+        if (aborted) {
+          const err = new Error("cancelled");
+          downloadDoneReject(err); // no-op if already resolved
+          mergeDoneReject(err);
+          return;
+        }
         if (code !== 0) {
           const msg = extractUsefulError(stderrBuf, "yt-dlp exited with code " + code);
-          return reject(new Error(msg));
+          const err = new Error(msg);
+          downloadDoneReject(err); // no-op if already resolved (merge format)
+          mergeDoneReject(err);
+          return;
         }
-        resolve({ tempPath, filename, entry, index: i });
+        // Non-merge: downloadDone fires here (same tick as mergeDone)
+        // Merge: downloadDone already resolved via stderr — this call is a no-op
+        downloadDoneResolve();
+        mergeDoneResolve({ tempPath, filename, entry, index: i });
       });
-    });
+
+      return { downloadDone, mergeDone };
+    };
 
     // Add a completed temp file into the archive (serialised via archiveLock)
     const appendToArchive = ({ tempPath, filename, entry, index }) => {
@@ -1682,15 +1731,32 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
     const entryPromises = entries.map((entry, i) => (async () => {
       if (aborted) return;
       await acquireSemaphore();
+
+      // Guard against double-releasing the semaphore slot.
+      // On the happy path: released after downloadDone (network done, ffmpeg still running).
+      // On error path:     released in catch (download failed before merge started).
+      let slotReleased = false;
+      const releaseOnce = () => {
+        if (!slotReleased) { slotReleased = true; releaseSemaphore(); }
+      };
+
       try {
-        const result = await downloadEntry(entry, i);
+        const { downloadDone, mergeDone } = downloadEntry(entry, i);
+
+        // Release the semaphore as soon as the download phase finishes so the
+        // next video can start downloading while ffmpeg runs in the background.
+        await downloadDone;
+        releaseOnce();
+
         if (!aborted) {
+          const result = await mergeDone;
           await appendToArchive(result);
           completed++;
           finishedCount++;
           emit("done", { current: finishedCount, total, title: entry.title || result.filename, completed, failed });
         }
       } catch (err) {
+        releaseOnce(); // no-op if already released (e.g. ffmpeg failed after download succeeded)
         finishedCount++;
         if (aborted) return;
         failed++;
@@ -1700,8 +1766,6 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
           name: "FAILED - " + title + ".txt",
         });
         emit("failed", { current: finishedCount, total, title: entry.title || title, completed, failed, error: err.message.slice(0, 200) });
-      } finally {
-        releaseSemaphore();
       }
     })());
 

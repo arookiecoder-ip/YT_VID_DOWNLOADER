@@ -652,7 +652,6 @@
       font-weight: 600;
       color: var(--text-dim);
       pointer-events: all;
-      cursor: pointer;
       user-select: none;
       letter-spacing: 0.04em;
       text-transform: uppercase;
@@ -660,6 +659,12 @@
 
     .dl-tray-header:hover {
       border-color: var(--text-dimmer);
+    }
+
+    .dl-tray-header-left {
+      display: flex;
+      align-items: center;
+      gap: 8px;
     }
 
     .dl-tray-badge {
@@ -671,6 +676,66 @@
       border-radius: 20px;
       min-width: 20px;
       text-align: center;
+    }
+
+    .dl-tray-toggle {
+      background: none;
+      border: none;
+      color: var(--text-dimmer);
+      cursor: pointer;
+      font-size: 0.85rem;
+      line-height: 1;
+      padding: 2px 4px;
+      display: flex;
+      align-items: center;
+      transition: transform 0.2s;
+    }
+
+    .dl-tray-toggle:hover {
+      color: var(--text);
+    }
+
+    .dl-tray-toggle.collapsed {
+      transform: rotate(180deg);
+    }
+
+    .dl-card-confirm {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 0.7rem;
+      color: var(--text-dim);
+      font-family: var(--mono);
+      margin-top: 6px;
+    }
+
+    .dl-card-confirm-yes {
+      background: var(--accent);
+      color: #fff;
+      border: none;
+      border-radius: 4px;
+      padding: 2px 10px;
+      cursor: pointer;
+      font-size: 0.68rem;
+      font-weight: 700;
+    }
+
+    .dl-card-confirm-yes:hover {
+      opacity: 0.85;
+    }
+
+    .dl-card-confirm-no {
+      background: var(--surface-3);
+      color: var(--text-dim);
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      padding: 2px 10px;
+      cursor: pointer;
+      font-size: 0.68rem;
+    }
+
+    .dl-card-confirm-no:hover {
+      color: var(--text);
     }
 
     .dl-tray-list {
@@ -982,9 +1047,12 @@
 
   <!-- Downloads Tray -->
   <div class="dl-tray" id="dlTray" style="display:none;">
-    <div class="dl-tray-header" onclick="toggleTray()">
-      <span>Downloads</span>
-      <span class="dl-tray-badge" id="dlTrayBadge">0</span>
+    <div class="dl-tray-header">
+      <div class="dl-tray-header-left">
+        <span>Downloads</span>
+        <span class="dl-tray-badge" id="dlTrayBadge">0</span>
+      </div>
+      <button class="dl-tray-toggle" id="dlTrayToggle" onclick="toggleTray()" title="Show / hide downloads">▲</button>
     </div>
     <div class="dl-tray-list" id="dlTrayList"></div>
   </div>
@@ -1379,11 +1447,12 @@
     function toggleTray() {
       trayCollapsed = !trayCollapsed;
       document.getElementById('dlTrayList').classList.toggle('collapsed', trayCollapsed);
+      const toggle = document.getElementById('dlTrayToggle');
+      if (toggle) toggle.classList.toggle('collapsed', trayCollapsed);
     }
 
-    // cancelFn: optional function to call when user clicks ✕ during download.
-    // If provided, the cancel button is shown immediately (red) and switches to
-    // a plain dismiss button once finishTrayCard() is called.
+    // cancelFn: optional — called when user confirms cancel.
+    // Shows a red ✕ button during download; clicking it reveals inline Yes/No.
     function createTrayCard(title, filename, cancelFn) {
       const id = 'dlcard-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7);
       const tray = document.getElementById('dlTray');
@@ -1393,20 +1462,40 @@
       card.className = 'dl-card';
       card.id = id;
       const safeTitle = title.replace(/</g,'&lt;').replace(/>/g,'&gt;');
-      const btnVisible = cancelFn ? '' : 'display:none';
-      const btnClass = cancelFn ? 'dl-card-dismiss cancel' : 'dl-card-dismiss';
-      const btnTitle = cancelFn ? 'Cancel download' : 'Dismiss';
       card.innerHTML = `
         <div class="dl-card-top">
           <div class="dl-card-title">${safeTitle}</div>
-          <button class="${btnClass}" id="${id}-btn" title="${btnTitle}" style="${btnVisible}">✕</button>
+          <button class="dl-card-dismiss${cancelFn ? ' cancel' : ''}" id="${id}-btn"
+            title="${cancelFn ? 'Cancel download' : 'Dismiss'}"
+            style="${cancelFn ? '' : 'display:none'}">✕</button>
         </div>
         <div class="dl-card-bar-outer"><div class="dl-card-bar-inner" id="${id}-bar"></div></div>
         <div class="dl-card-status"><span id="${id}-pct">Waiting…</span><span id="${id}-size">${filename}</span></div>
+        <div class="dl-card-confirm" id="${id}-confirm" style="display:none">
+          Cancel this download?
+          <button class="dl-card-confirm-yes" id="${id}-yes">Yes</button>
+          <button class="dl-card-confirm-no" id="${id}-no">No</button>
+        </div>
       `;
 
       if (cancelFn) {
-        card.querySelector(`#${id}-btn`).addEventListener('click', () => cancelFn());
+        const btn = card.querySelector(`#${id}-btn`);
+        const confirmRow = card.querySelector(`#${id}-confirm`);
+        const yesBtn = card.querySelector(`#${id}-yes`);
+        const noBtn = card.querySelector(`#${id}-no`);
+
+        btn.addEventListener('click', () => {
+          btn.style.display = 'none';
+          confirmRow.style.display = 'flex';
+        });
+        yesBtn.addEventListener('click', () => {
+          confirmRow.style.display = 'none';
+          cancelFn();
+        });
+        noBtn.addEventListener('click', () => {
+          confirmRow.style.display = 'none';
+          btn.style.display = '';
+        });
       }
 
       list.appendChild(card);
@@ -1414,6 +1503,8 @@
       if (trayCollapsed) {
         trayCollapsed = false;
         document.getElementById('dlTrayList').classList.remove('collapsed');
+        const toggle = document.getElementById('dlTrayToggle');
+        if (toggle) toggle.classList.remove('collapsed');
       }
       updateTrayBadge();
       return id;
@@ -1431,6 +1522,9 @@
     function finishTrayCard(id, success, message) {
       const card = document.getElementById(id);
       if (!card) return;
+      // Hide any pending confirmation row
+      const confirmRow = document.getElementById(id + '-confirm');
+      if (confirmRow) confirmRow.style.display = 'none';
       card.classList.add(success ? 'done' : 'failed');
       const bar = document.getElementById(id + '-bar');
       if (bar) bar.style.width = '100%';
@@ -1442,12 +1536,11 @@
       }
       const sizeEl = document.getElementById(id + '-size');
       if (sizeEl && message) sizeEl.textContent = message;
-      // Switch from cancel button → dismiss button
+      // Switch from cancel button → dismiss button (clone removes old listeners)
       const btn = document.getElementById(id + '-btn');
       if (btn) {
         btn.className = 'dl-card-dismiss';
         btn.title = 'Dismiss';
-        // Replace listeners by cloning (removes the cancel click handler)
         const fresh = btn.cloneNode(true);
         fresh.style.display = '';
         fresh.addEventListener('click', () => dismissTrayCard(id));
@@ -1709,7 +1802,9 @@
       document.getElementById('uploadDate').textContent = isPlaylist
         ? 'Playlist'
         : (video.uploadDate || '—');
-      document.querySelector('#downloadBtn span').textContent = getDefaultDownloadButtonLabel();
+      const dlBtn = document.getElementById('downloadBtn');
+      dlBtn.querySelector('span').textContent = getDefaultDownloadButtonLabel();
+      dlBtn.disabled = false; // re-enable in case a playlist download was in progress for a previous search
 
       const grid = document.getElementById('formatGrid');
       grid.innerHTML = '';

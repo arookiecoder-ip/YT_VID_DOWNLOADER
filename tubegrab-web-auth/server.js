@@ -1599,8 +1599,9 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
     const archive = archiver("zip", { zlib: { level: 0 } });
     archive.on("warning", (err) => console.warn("[playlist-zip] archiver warning:", err.message));
     archive.on("error", (err) => {
-      if (!aborted) console.error("[playlist-zip] archiver error:", err.message);
-      res.destroy(err);
+      if (aborted) return; // abort() already tore down the pipeline — ignore downstream errors
+      console.error("[playlist-zip] archiver error:", err.message);
+      if (!res.destroyed) res.destroy(err);
     });
     archive.pipe(res);
 
@@ -1803,8 +1804,7 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
       await archive.finalize();
       emit("complete", { total, completed, failed });
     } else {
-      archive.abort();
-      res.destroy();
+      archive.abort(); // ends the pipe to res; do NOT call res.destroy() — double-destroy crashes Node
     }
     closeProgress();
   } catch (err) {
@@ -1812,10 +1812,11 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
     if (!aborted) console.error("[playlist-zip]", err.message);
     emit("zip-error", { error: err.message.slice(0, 300) });
     closeProgress();
+    if (aborted) return; // abort() already handled teardown
     if (!res.headersSent) {
       return res.status(500).json({ error: "Playlist ZIP failed: " + err.message.slice(0, 300) });
     }
-    res.destroy(err);
+    if (!res.destroyed) res.destroy(err);
   }
 });
 

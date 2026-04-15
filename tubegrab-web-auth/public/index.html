@@ -845,8 +845,13 @@
       justify-content: space-between;
     }
 
-    .dl-card-status .status-ok { color: var(--success); }
-    .dl-card-status .status-err { color: #ff6688; }
+    .dl-card-status .status-ok {
+      color: var(--success);
+    }
+
+    .dl-card-status .status-err {
+      color: #ff6688;
+    }
 
     @media (max-width: 520px) {
       .dl-tray {
@@ -962,9 +967,14 @@
     <section class="search-section">
       <div class="search-box">
         <div class="search-input-wrap">
-          <input type="text" id="urlInput" placeholder="Paste a YouTube URL here…" spellcheck="false" autocomplete="off">
-          <button type="button" class="btn-clear" id="clearBtn" onclick="clearSearch()" title="Clear" aria-label="Clear search" hidden>
-            <svg viewBox="0 0 24 24"><path d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z"/></svg>
+          <input type="text" id="urlInput" placeholder="Paste a YouTube URL here…" spellcheck="false"
+            autocomplete="off">
+          <button type="button" class="btn-clear" id="clearBtn" onclick="clearSearch()" title="Clear"
+            aria-label="Clear search" hidden>
+            <svg viewBox="0 0 24 24">
+              <path
+                d="M19 6.41 17.59 5 12 10.59 6.41 5 5 6.41 10.59 12 5 17.59 6.41 19 12 13.41 17.59 19 19 17.59 13.41 12z" />
+            </svg>
           </button>
         </div>
         <button class="btn-fetch" id="fetchBtn" onclick="fetchVideo()">
@@ -1042,6 +1052,13 @@
       Please only download content you have the right to access.<br>
       Respect copyright laws and YouTube's Terms of Service.
       <div id="buildStamp" style="margin-top:8px;opacity:0.55;font-size:11px;">Loading version…</div>
+      <a href="https://github.com/arookiecoder-ip" target="_blank"
+        style="margin-top:12px;display:inline-flex;align-items:center;gap:6px;opacity:0.55;font-size:11px;color:var(--text-dim);text-decoration:none;transition:opacity 0.2s;"
+        onmouseover="this.style.opacity='0.85'" onmouseout="this.style.opacity='0.55'"><svg viewBox="0 0 24 24"
+          style="width:14px;height:14px;fill:currentColor;">
+          <path
+            d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.768.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v 3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z" />
+        </svg>arookiecoder</a>
     </footer>
   </div>
 
@@ -1462,7 +1479,7 @@
       const card = document.createElement('div');
       card.className = 'dl-card';
       card.id = id;
-      const safeTitle = title.replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      const safeTitle = title.replace(/</g, '&lt;').replace(/>/g, '&gt;');
       card.innerHTML = `
         <div class="dl-card-top">
           <div class="dl-card-title">${safeTitle}</div>
@@ -1665,7 +1682,7 @@
           try {
             const d = JSON.parse(e.data);
             console.warn('[SSE] server error:', d.error);
-          } catch {}
+          } catch { }
         });
 
         // Start the ZIP request (runs in parallel with SSE updates)
@@ -1904,7 +1921,7 @@
         if (cancelled) return;
         cancelled = true;
         if (token) {
-          fetch(`${API_BASE}/api/download/cancel/${token}`, { method: 'POST' }).catch(() => {});
+          fetch(`${API_BASE}/api/download/cancel/${token}`, { method: 'POST' }).catch(() => { });
         }
       };
       const cardId = createTrayCard(videoTitle, suggestedFilename, cancelDownload);

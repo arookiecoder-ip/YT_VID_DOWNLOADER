@@ -1288,10 +1288,27 @@
     });
 
     // When the user returns to the page from bfcache (e.g. unlocks screen, switches back),
-    // the SSE connection and fetch stream are dead. Show a toast so they know to check status.
-    window.addEventListener('pageshow', (event) => {
-      if (event.persisted && activePlaylistProgressId) {
-        showToast('Download is still running on the server. Check your tray for progress.', 'success');
+    // the SSE connection and fetch stream are dead.
+    // Try to re-fetch the finished ZIP from the server if it's ready, otherwise show toast.
+    window.addEventListener('pageshow', async (event) => {
+      if (!event.persisted || !activePlaylistProgressId) return;
+      const id = activePlaylistProgressId;
+      try {
+        const check = await fetch(`${API_BASE}/api/download/playlist-zip/file/${id}`, { method: 'HEAD' });
+        if (check.ok || check.status === 206) {
+          // ZIP is ready — trigger download
+          showToast('ZIP ready! Starting download…', 'success');
+          const a = document.createElement('a');
+          a.href = `${API_BASE}/api/download/playlist-zip/file/${id}`;
+          a.download = '';
+          document.body.appendChild(a);
+          a.click();
+          setTimeout(() => a.remove(), 1000);
+        } else {
+          showToast('Download still running on server — check tray for progress.', 'success');
+        }
+      } catch {
+        showToast('Download still running on server — check tray for progress.', 'success');
       }
     });
 
@@ -1916,10 +1933,27 @@
             const fnMatch = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';\r\n]+)/i);
             if (fnMatch) filename = decodeURIComponent(fnMatch[1].trim().replace(/^["']|["']$/g, ''));
 
-            // showSaveFilePicker cannot be used here — it requires a synchronous user
-            // gesture, but we are already inside an async fetch continuation. Use the
-            // blob + anchor approach which works in all browsers.
-            const blob = await res.blob();
+            // Stream ZIP to blob in chunks (avoids buffering entire file in RAM)
+            // then trigger browser download via object URL
+            const zipTotal = Number(res.headers.get('Content-Length') || 0);
+            const zipReader = res.body.getReader();
+            const zipChunks = [];
+            let zipReceived = 0;
+            while (true) {
+              if (cancelled) { zipReader.cancel(); throw new Error('cancelled'); }
+              const { done, value } = await zipReader.read();
+              if (done) break;
+              zipChunks.push(value);
+              zipReceived += value.byteLength || 0;
+              if (zipTotal > 0) {
+                const pct = 93 + Math.round((zipReceived / zipTotal) * 6);
+                updateTrayCard(cardId, Math.min(99, pct), 'Receiving ZIP…',
+                  `${formatBytes(zipReceived)} / ${formatBytes(zipTotal)}`);
+              } else {
+                updateTrayCard(cardId, 97, 'Receiving ZIP…', formatBytes(zipReceived));
+              }
+            }
+            const blob = new Blob(zipChunks, { type: 'application/zip' });
             const objectUrl = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = objectUrl;

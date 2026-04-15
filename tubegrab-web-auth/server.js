@@ -1499,6 +1499,9 @@ async function streamDownload(req, res) {
 // In-memory SSE progress channels for playlist ZIP jobs.
 // Key: progressId (random hex), Value: { send(event, data), close() }
 const zipProgressChannels = new Map();
+// Stores finished ZIP temp paths keyed by progressId for re-download after reconnect.
+// Entry: { path, filename, size, createdAt }
+const zipFileStore = new Map();
 
 // GET /api/download/playlist-zip/progress/:id — SSE stream for ZIP progress
 app.get("/api/download/playlist-zip/progress/:id", (req, res) => {
@@ -1570,11 +1573,11 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
   // Register this job so /cancel can reach it
   if (progressId) zipProgressChannels.set("abort:" + progressId, { abort });
 
-  // Detect client disconnect (tab closed, network drop, etc.)
-  // A 30s grace period lets the client reconnect after a brief network blip before yt-dlp is killed.
+  // Detect client disconnect (tab closed, network drop, mobile backgrounding etc.)
+  // 5 min grace period — mobile browsers can background for several minutes.
   let disconnectTimer = null;
   res.on("close", () => {
-    disconnectTimer = setTimeout(() => abort("client disconnected"), 30 * 1000);
+    disconnectTimer = setTimeout(() => abort("client disconnected"), 5 * 60 * 1000);
   });
 
   // Helper: send SSE event if a progress channel is registered
@@ -1624,19 +1627,20 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
 
     emit("status", { stage: "Starting download…", current: 0, total });
 
-    // Headers must be set before archiver starts writing
-    res.setHeader("Content-Type", "application/zip");
-    res.setHeader("Content-Disposition", buildContentDisposition(playlistTitle + ".zip"));
-    res.setHeader("Cache-Control", "no-store");
+    // Write ZIP to a temp file first so the client can reconnect and resume
+    // downloading even if the connection drops mid-transfer (mobile backgrounding etc.)
+    const zipTempPath = path.join(os.tmpdir(), "plzip-archive-" + crypto.randomUUID() + ".zip");
+    tempFiles.add(zipTempPath);
+    const zipWriteStream = fs.createWriteStream(zipTempPath);
 
     const archive = archiver("zip", { zlib: { level: 0 } });
     archive.on("warning", (err) => console.warn("[playlist-zip] archiver warning:", err.message));
     archive.on("error", (err) => {
-      if (aborted) return; // abort() already tore down the pipeline — ignore downstream errors
+      if (aborted) return;
       console.error("[playlist-zip] archiver error:", err.message);
-      if (!res.destroyed) res.destroy(err);
+      zipWriteStream.destroy(err);
     });
-    archive.pipe(res);
+    archive.pipe(zipWriteStream);
 
     let completed = 0;
     let failed = 0;
@@ -1833,19 +1837,103 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
     await archiveLock;
     cleanupTempFiles();
 
-    if (!aborted) {
-      await archive.finalize();
-      emit("complete", { total, completed, failed });
-    } else {
-      archive.abort(); // ends the pipe to res; do NOT call res.destroy() — double-destroy crashes Node
+    if (aborted) {
+      archive.abort();
+      closeProgress();
+      try { fs.unlinkSync(zipTempPath); } catch {}
+      return;
     }
+
+    // Finalise ZIP — waits until all bytes are flushed to zipTempPath
+    await new Promise((resolve, reject) => {
+      zipWriteStream.on("finish", resolve);
+      zipWriteStream.on("error", reject);
+      archive.finalize();
+    });
+
+    emit("complete", { total, completed, failed });
     closeProgress();
+
+    if (aborted) {
+      try { fs.unlinkSync(zipTempPath); } catch {}
+      return;
+    }
+
+    // Serve the finished ZIP with Range support so clients can resume on reconnect
+    const zipFilename = playlistTitle + ".zip";
+
+    // Register in store so the client can re-fetch via GET /api/download/playlist-zip/file/:id
+    if (progressId) {
+      zipFileStore.set(progressId, {
+        path: zipTempPath,
+        filename: zipFilename,
+        size: zipTotalSize,
+        createdAt: Date.now(),
+      });
+      // Auto-delete from store after 30 min
+      setTimeout(() => {
+        const entry = zipFileStore.get(progressId);
+        if (entry) { try { fs.unlinkSync(entry.path); } catch {} zipFileStore.delete(progressId); }
+      }, 30 * 60 * 1000).unref();
+    }
+    const zipStat = fs.statSync(zipTempPath);
+    const zipTotalSize = zipStat.size;
+
+    const rangeHeader = req.headers["range"];
+    let start = 0;
+    let end = zipTotalSize - 1;
+    let isPartial = false;
+    if (rangeHeader) {
+      const match = rangeHeader.match(/bytes=(\d+)-(\d*)/);
+      if (match) {
+        start = parseInt(match[1], 10);
+        end = match[2] ? parseInt(match[2], 10) : zipTotalSize - 1;
+        if (start < zipTotalSize && end < zipTotalSize && start <= end) isPartial = true;
+      }
+    }
+    const chunkSize = end - start + 1;
+
+    const zipHeaders = {
+      "Content-Type": "application/zip",
+      "Content-Disposition": buildContentDisposition(zipFilename),
+      "Cache-Control": "no-store",
+      "Accept-Ranges": "bytes",
+      "Content-Length": String(chunkSize),
+    };
+    if (isPartial) zipHeaders["Content-Range"] = `bytes ${start}-${end}/${zipTotalSize}`;
+    res.set(zipHeaders);
+    if (isPartial) res.status(206);
+
+    // Stream ZIP to client; delete after transfer
+    const zipFileStream = fs.createReadStream(zipTempPath, { start, end });
+    zipFileStream.on("error", (err) => {
+      if (!res.headersSent) res.status(500).json({ error: "ZIP read failed: " + err.message });
+      else res.destroy(err);
+    });
+    zipFileStream.on("close", () => {
+      // Only delete after full transfer (non-partial) to allow retries
+      if (!isPartial) {
+        try { fs.unlinkSync(zipTempPath); } catch {}
+        tempFiles.delete(zipTempPath);
+      }
+    });
+    res.on("close", () => {
+      // If client disconnects mid-transfer, keep the file for 10 min to allow resume
+      if (!res.writableEnded) {
+        setTimeout(() => {
+          try { fs.unlinkSync(zipTempPath); } catch {}
+          tempFiles.delete(zipTempPath);
+        }, 10 * 60 * 1000).unref();
+      }
+    });
+    zipFileStream.pipe(res);
+
   } catch (err) {
     cleanupTempFiles();
     if (!aborted) console.error("[playlist-zip]", err.message);
     emit("zip-error", { error: err.message.slice(0, 300) });
     closeProgress();
-    if (aborted) return; // abort() already handled teardown
+    if (aborted) return;
     if (!res.headersSent) {
       return res.status(500).json({ error: "Playlist ZIP failed: " + err.message.slice(0, 300) });
     }
@@ -1861,6 +1949,56 @@ app.post("/api/download/playlist-zip/cancel/:id", (req, res) => {
   const abortHandle = zipProgressChannels.get("abort:" + id);
   if (abortHandle) abortHandle.abort("cancel endpoint");
   res.status(204).end();
+});
+
+// GET /api/download/playlist-zip/file/:id — re-download a finished playlist ZIP.
+// Used when the client reconnects after a drop (mobile backgrounding, network change etc.)
+// Supports Range requests for resumable download.
+app.get("/api/download/playlist-zip/file/:id", (req, res) => {
+  const id = String(req.params.id || "").trim();
+  if (!id || !/^[0-9a-f]{32}$/.test(id)) return res.status(400).json({ error: "Invalid id" });
+  const entry = zipFileStore.get(id);
+  if (!entry) return res.status(404).json({ error: "ZIP not found or expired" });
+  if (!fs.existsSync(entry.path)) {
+    zipFileStore.delete(id);
+    return res.status(410).json({ error: "ZIP file already deleted" });
+  }
+
+  const totalSize = entry.size;
+  const rangeHeader = req.headers["range"];
+  let start = 0;
+  let end = totalSize - 1;
+  let isPartial = false;
+  if (rangeHeader) {
+    const match = rangeHeader.match(/bytes=(\d+)-(\d*)/);
+    if (match) {
+      start = parseInt(match[1], 10);
+      end = match[2] ? parseInt(match[2], 10) : totalSize - 1;
+      if (start >= totalSize || end >= totalSize || start > end) {
+        res.set("Content-Range", `bytes */${totalSize}`);
+        return res.status(416).end();
+      }
+      isPartial = true;
+    }
+  }
+
+  const headers = {
+    "Content-Type": "application/zip",
+    "Content-Disposition": buildContentDisposition(entry.filename),
+    "Cache-Control": "no-store",
+    "Accept-Ranges": "bytes",
+    "Content-Length": String(end - start + 1),
+  };
+  if (isPartial) headers["Content-Range"] = `bytes ${start}-${end}/${totalSize}`;
+  res.set(headers);
+  if (isPartial) res.status(206);
+
+  const stream = fs.createReadStream(entry.path, { start, end });
+  stream.on("error", (err) => {
+    if (!res.headersSent) res.status(500).json({ error: "Read failed: " + err.message });
+    else res.destroy(err);
+  });
+  stream.pipe(res);
 });
 
 // GET /api/download — legacy direct stream (used by playlist iframe fallback)

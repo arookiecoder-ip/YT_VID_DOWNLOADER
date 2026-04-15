@@ -1082,7 +1082,7 @@ if (typeof jobSweepTimer.unref === "function") {
   jobSweepTimer.unref();
 }
 
-function performDownload(url, formatId, isAudio, { onProgress, onStage } = {}) {
+function performDownload(url, formatId, isAudio, { onProgress, onStage, onProc } = {}) {
   const outputExt = isAudio ? "mp3" : "mp4";
   const selector = getFormatSelector(formatId, isAudio);
   const needsMerge = !isAudio && selector.includes("+");
@@ -1097,6 +1097,7 @@ function performDownload(url, formatId, isAudio, { onProgress, onStage } = {}) {
     const proc = spawn(YT_DLP, ytdlpArgs, {
       stdio: ["ignore", "pipe", "pipe"],
     });
+    if (onProc) onProc(proc);
     let stderr = "";
     let streamIndex = 0;
     const expectedStreams = isAudio ? 1 : needsMerge ? 2 : 1;
@@ -1257,6 +1258,10 @@ async function runDownloadJob(token, url, formatId, isAudio) {
           progress: Math.max(lastProgress, 78),
         });
       },
+      onProc: (proc) => {
+        // Store kill handle so /cancel endpoint can terminate the process
+        updateJob(token, { killProc: () => { try { proc.kill("SIGKILL"); } catch {} } });
+      },
     });
     producedPath = result.path;
 
@@ -1272,15 +1277,19 @@ async function runDownloadJob(token, url, formatId, isAudio) {
       filePath: producedPath,
       contentType: isAudio ? "audio/mpeg" : "video/mp4",
       fileSize: stat.size,
+      killProc: null,
     });
     console.log("[job:" + token.slice(0, 6) + "] done →", filename);
   } catch (err) {
+    const job = jobs.get(token);
+    if (job && job.state === "cancelled") return; // already handled by cancel endpoint
     console.error("[job:" + token.slice(0, 6) + "] error:", err.message);
     removeFileQuietly(producedPath);
     updateJob(token, {
       state: "error",
       stage: "Failed",
       error: err.message.slice(0, 300),
+      killProc: null,
     });
   }
 }
@@ -1381,6 +1390,22 @@ app.get("/api/download/file/:token", (req, res) => {
     else res.destroy(err);
   });
   fileStream.pipe(res);
+});
+
+// POST /api/download/cancel/:token — cancel an in-progress single-video job
+app.post("/api/download/cancel/:token", (req, res) => {
+  const token = String(req.params.token || "").trim();
+  const job = jobs.get(token);
+  if (!job) return res.status(404).json({ error: "Job not found or already finished" });
+  if (job.state !== "pending") return res.status(409).json({ error: "Job already finished" });
+
+  // Kill the yt-dlp process immediately
+  if (typeof job.killProc === "function") job.killProc();
+
+  // Mark as cancelled so runDownloadJob's catch block skips the error update
+  jobs.set(token, { ...job, state: "cancelled", stage: "Cancelled", killProc: null });
+  console.log("[job:" + token.slice(0, 6) + "] cancelled by client");
+  res.status(204).end();
 });
 
 // Legacy direct-download (kept for iframe fallback path used by playlists)

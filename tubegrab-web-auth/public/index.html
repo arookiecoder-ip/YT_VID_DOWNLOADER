@@ -738,6 +738,15 @@
       color: var(--text);
     }
 
+    .dl-card-dismiss.cancel {
+      color: var(--accent);
+      opacity: 0.7;
+    }
+
+    .dl-card-dismiss.cancel:hover {
+      opacity: 1;
+    }
+
     .dl-card-bar-outer {
       width: 100%;
       height: 5px;
@@ -994,7 +1003,7 @@
     // 1. Warn the user if a download is active (beforeunload)
     // 2. Fire a cancel beacon so the server kills yt-dlp and deletes temp files (pagehide)
     window.addEventListener('beforeunload', e => {
-      if (activeDownloads > 0) {
+      if (activeDownloads > 0 || activePlaylistProgressId) {
         e.preventDefault();
         e.returnValue = '';
       }
@@ -1372,7 +1381,10 @@
       document.getElementById('dlTrayList').classList.toggle('collapsed', trayCollapsed);
     }
 
-    function createTrayCard(title, filename) {
+    // cancelFn: optional function to call when user clicks ✕ during download.
+    // If provided, the cancel button is shown immediately (red) and switches to
+    // a plain dismiss button once finishTrayCard() is called.
+    function createTrayCard(title, filename, cancelFn) {
       const id = 'dlcard-' + Date.now() + '-' + Math.random().toString(36).slice(2, 7);
       const tray = document.getElementById('dlTray');
       const list = document.getElementById('dlTrayList');
@@ -1380,14 +1392,22 @@
       const card = document.createElement('div');
       card.className = 'dl-card';
       card.id = id;
+      const safeTitle = title.replace(/</g,'&lt;').replace(/>/g,'&gt;');
+      const btnVisible = cancelFn ? '' : 'display:none';
+      const btnClass = cancelFn ? 'dl-card-dismiss cancel' : 'dl-card-dismiss';
+      const btnTitle = cancelFn ? 'Cancel download' : 'Dismiss';
       card.innerHTML = `
         <div class="dl-card-top">
-          <div class="dl-card-title">${title.replace(/</g,'&lt;').replace(/>/g,'&gt;')}</div>
-          <button class="dl-card-dismiss" title="Dismiss" onclick="dismissTrayCard('${id}')" style="display:none">✕</button>
+          <div class="dl-card-title">${safeTitle}</div>
+          <button class="${btnClass}" id="${id}-btn" title="${btnTitle}" style="${btnVisible}">✕</button>
         </div>
         <div class="dl-card-bar-outer"><div class="dl-card-bar-inner" id="${id}-bar"></div></div>
         <div class="dl-card-status"><span id="${id}-pct">Waiting…</span><span id="${id}-size">${filename}</span></div>
       `;
+
+      if (cancelFn) {
+        card.querySelector(`#${id}-btn`).addEventListener('click', () => cancelFn());
+      }
 
       list.appendChild(card);
       tray.style.display = 'flex';
@@ -1413,7 +1433,7 @@
       if (!card) return;
       card.classList.add(success ? 'done' : 'failed');
       const bar = document.getElementById(id + '-bar');
-      if (bar) bar.style.width = success ? '100%' : '100%';
+      if (bar) bar.style.width = '100%';
       const pctEl = document.getElementById(id + '-pct');
       if (pctEl) {
         pctEl.innerHTML = success
@@ -1422,8 +1442,17 @@
       }
       const sizeEl = document.getElementById(id + '-size');
       if (sizeEl && message) sizeEl.textContent = message;
-      const btn = card.querySelector('.dl-card-dismiss');
-      if (btn) btn.style.display = '';
+      // Switch from cancel button → dismiss button
+      const btn = document.getElementById(id + '-btn');
+      if (btn) {
+        btn.className = 'dl-card-dismiss';
+        btn.title = 'Dismiss';
+        // Replace listeners by cloning (removes the cancel click handler)
+        const fresh = btn.cloneNode(true);
+        fresh.style.display = '';
+        fresh.addEventListener('click', () => dismissTrayCard(id));
+        btn.replaceWith(fresh);
+      }
       updateTrayBadge();
     }
 
@@ -1451,12 +1480,7 @@
 
       const playlistTitle = currentVideo.title || 'Playlist';
       const total = entries.length;
-      const cardId = createTrayCard(playlistTitle, `${total} videos`);
       const btn = document.getElementById('downloadBtn');
-
-      btn.disabled = true;
-      btn.querySelector('span').textContent = 'Preparing ZIP…';
-      updateTrayCard(cardId, 0, 'Fetching playlist info…', `0 / ${total}`);
 
       // Generate a random progress ID and open SSE channel before starting the ZIP request
       const progressId = Array.from(crypto.getRandomValues(new Uint8Array(16)))
@@ -1465,6 +1489,22 @@
       let sse = null;
       let zipCompleted = 0;
       let zipFailed = 0;
+      let cancelled = false;
+      const fetchAbort = new AbortController();
+
+      // Cancel function: abort the fetch stream and tell the server to kill yt-dlp
+      const cancelDownload = () => {
+        if (cancelled) return;
+        cancelled = true;
+        fetchAbort.abort();
+        navigator.sendBeacon(`${API_BASE}/api/download/playlist-zip/cancel/${progressId}`);
+      };
+
+      const cardId = createTrayCard(playlistTitle, `${total} videos`, cancelDownload);
+
+      btn.disabled = true;
+      btn.querySelector('span').textContent = 'Preparing ZIP…';
+      updateTrayCard(cardId, 0, 'Fetching playlist info…', `0 / ${total}`);
 
       // Track this progress ID globally so pagehide can fire the cancel beacon
       activePlaylistProgressId = progressId;
@@ -1540,6 +1580,7 @@
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ url: currentVideo.url, formatId, ext, progressId }),
+          signal: fetchAbort.signal,
         });
 
         if (!res.ok) {
@@ -1573,9 +1614,13 @@
         finishTrayCard(cardId, true, summary);
         showToast(`Playlist ZIP ready: ${filename}`);
       } catch (err) {
-        console.error('Playlist ZIP failed:', err);
-        finishTrayCard(cardId, false, err.message || 'ZIP download failed');
-        showToast(err.message || 'Playlist ZIP failed', 'error');
+        if (cancelled || err.name === 'AbortError') {
+          finishTrayCard(cardId, false, 'Cancelled');
+        } else {
+          console.error('Playlist ZIP failed:', err);
+          finishTrayCard(cardId, false, err.message || 'ZIP download failed');
+          showToast(err.message || 'Playlist ZIP failed', 'error');
+        }
       } finally {
         if (sse) sse.close();
         activePlaylistProgressId = null; // no longer need the cancel beacon
@@ -1757,7 +1802,16 @@
 
       // User picked a save location — create tray card and start async work.
       // The main card is now free to be reused for a new video search.
-      const cardId = createTrayCard(videoTitle, suggestedFilename);
+      let token = null;
+      let cancelled = false;
+      const cancelDownload = () => {
+        if (cancelled) return;
+        cancelled = true;
+        if (token) {
+          fetch(`${API_BASE}/api/download/cancel/${token}`, { method: 'POST' }).catch(() => {});
+        }
+      };
+      const cardId = createTrayCard(videoTitle, suggestedFilename, cancelDownload);
       activeDownloads++;
 
       let writable = null;
@@ -1780,9 +1834,9 @@
           const errData = await startRes.json().catch(() => ({}));
           throw new Error(errData.error || `Server error ${startRes.status}`);
         }
-        const { token } = await startRes.json();
+        ({ token } = await startRes.json());
 
-        // Phase 2: poll status until done or error
+        // Phase 2: poll status until done, error, or cancelled
         await new Promise((resolve, reject) => {
           const startedAt = Date.now();
           const MAX_ELAPSED_MS = 30 * 60 * 1000;
@@ -1794,12 +1848,14 @@
             ? `${Math.floor(sec / 60)}m ${sec % 60}s`
             : `${sec}s`;
           const ticker = setInterval(() => {
+            if (cancelled) { clearInterval(ticker); return reject(new Error('cancelled')); }
             const sec = Math.round((Date.now() - startedAt) / 1000);
             updateTrayCard(cardId, lastProgress, lastStage, fmtElapsed(sec));
           }, 1000);
           const stop = () => clearInterval(ticker);
 
           const poll = async () => {
+            if (cancelled) { stop(); return reject(new Error('cancelled')); }
             if (Date.now() - startedAt > MAX_ELAPSED_MS) {
               stop();
               return reject(new Error('Download timed out after 30 minutes.'));
@@ -1813,6 +1869,7 @@
               }
               consecutiveFailures = 0;
               const status = await statusRes.json();
+              if (status.state === 'cancelled') { stop(); return reject(new Error('cancelled')); }
               lastProgress = status.progress || 0;
               lastStage = status.stage || 'Working…';
               const sec = Math.round((Date.now() - startedAt) / 1000);
@@ -1821,6 +1878,7 @@
               if (status.state === 'error') { stop(); return reject(new Error(status.error || 'Download failed on server')); }
               setTimeout(poll, 3000);
             } catch (err) {
+              if (cancelled) { stop(); return reject(new Error('cancelled')); }
               consecutiveFailures += 1;
               if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
                 stop();
@@ -1864,8 +1922,12 @@
         showToast(`Done: ${videoTitle.slice(0, 40)}`);
       } catch (err) {
         if (writable) { try { await writable.abort(); } catch (_) { } }
-        finishTrayCard(cardId, false, (err.message || 'Unknown error').slice(0, 60));
-        showToast('Download failed: ' + (err.message || 'Unknown error').slice(0, 60), 'error');
+        if (cancelled || err.message === 'cancelled') {
+          finishTrayCard(cardId, false, 'Cancelled');
+        } else {
+          finishTrayCard(cardId, false, (err.message || 'Unknown error').slice(0, 60));
+          showToast('Download failed: ' + (err.message || 'Unknown error').slice(0, 60), 'error');
+        }
       } finally {
         activeDownloads = Math.max(0, activeDownloads - 1);
       }

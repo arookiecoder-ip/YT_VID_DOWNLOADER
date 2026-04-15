@@ -1072,8 +1072,9 @@
     // 2. Fire a cancel beacon so the server kills yt-dlp and deletes temp files (pagehide)
     window.addEventListener('beforeunload', e => {
       if (activeDownloads > 0 || activePlaylistProgressId) {
-        e.preventDefault();
-        e.returnValue = '';
+        // returnValue must be a non-empty string — Chrome ignores empty string / e.preventDefault() alone
+        e.returnValue = 'A download is in progress. If you leave, the download will be cancelled.';
+        return e.returnValue;
       }
     });
 

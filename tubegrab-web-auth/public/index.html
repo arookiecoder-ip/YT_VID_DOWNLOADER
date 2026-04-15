@@ -2433,65 +2433,90 @@
           poll();
         });
 
-        // Phase 3: fetch file into memory with retry, then flush to disk in one shot.
-        // Buffering avoids partial-write issues if the network drops mid-stream — we
-        // can retry the fetch without needing to seek or reopen the file picker.
-        const MAX_FILE_RETRIES = 3;
-        let fileBytes = null;
+        // Phase 3: chunked range-request streaming directly to disk.
+        // Downloads in 32MB chunks using Range headers. Each chunk is written to the
+        // writable at the correct byte offset as it arrives — no RAM buffering.
+        // On network drop, retries the same chunk from the same offset (up to 10×).
+        const CHUNK_SIZE = 32 * 1024 * 1024; // 32 MB per chunk
+        const MAX_CHUNK_RETRIES = 10;
+        let received = 0;
+        const total = knownBytes || 0;
 
-        for (let attempt = 1; attempt <= MAX_FILE_RETRIES; attempt++) {
+        updateTrayCard(cardId, 0, 'Saving…', total > 0 ? `0 / ${formatBytes(total)}` : '');
+
+        // Keep fetching chunks until we have the whole file
+        while (true) {
           if (cancelled) throw new Error('cancelled');
-          try {
-            updateTrayCard(cardId, 0,
-              attempt > 1 ? `Reconnecting… (attempt ${attempt}/${MAX_FILE_RETRIES})` : 'Saving…', '');
-            fileStreamAbort = new AbortController();
-            const fileRes = await fetch(`${API_BASE}/api/download/file/${token}`, {
-              signal: fileStreamAbort.signal,
-            });
-            if (!fileRes.ok) {
-              const errData = await fileRes.json().catch(() => ({}));
-              throw new Error(errData.error || `File fetch failed (${fileRes.status})`);
-            }
+          if (total > 0 && received >= total) break;
 
-            const total = Number(fileRes.headers.get('Content-Length') || 0);
-            const reader = fileRes.body && fileRes.body.getReader ? fileRes.body.getReader() : null;
-            if (!reader) throw new Error('Streaming not supported in this browser.');
+          const rangeStart = received;
+          const rangeEnd = total > 0 ? Math.min(received + CHUNK_SIZE - 1, total - 1) : received + CHUNK_SIZE - 1;
+          const rangeHeader = total > 0
+            ? `bytes=${rangeStart}-${rangeEnd}`
+            : `bytes=${rangeStart}-`;
 
-            const chunks = [];
-            let received = 0;
-            while (true) {
-              if (cancelled) { reader.cancel(); throw new Error('cancelled'); }
-              const { done, value } = await reader.read();
-              if (done) break;
-              chunks.push(value);
-              received += value.byteLength || value.length || 0;
-              if (total > 0) {
-                const pct = Math.min(99, Math.round((received / total) * 100));
-                updateTrayCard(cardId, pct, `Saving… ${pct}%`,
-                  `${formatBytes(received)} / ${formatBytes(total)}`);
-              } else {
-                updateTrayCard(cardId, 99, 'Saving…', formatBytes(received));
+          let chunkRetries = 0;
+          let chunkDone = false;
+
+          while (!chunkDone) {
+            if (cancelled) throw new Error('cancelled');
+            try {
+              fileStreamAbort = new AbortController();
+              const chunkRes = await fetch(`${API_BASE}/api/download/file/${token}`, {
+                headers: { 'Range': rangeHeader },
+                signal: fileStreamAbort.signal,
+              });
+
+              if (chunkRes.status === 416) throw new Error('File range error — file may have expired');
+              if (!chunkRes.ok && chunkRes.status !== 206 && chunkRes.status !== 200) {
+                const errData = await chunkRes.json().catch(() => ({}));
+                throw new Error(errData.error || `Chunk fetch failed (${chunkRes.status})`);
               }
+
+              const reader = chunkRes.body && chunkRes.body.getReader
+                ? chunkRes.body.getReader()
+                : null;
+              if (!reader) throw new Error('Streaming not supported in this browser.');
+
+              let wroteInThisChunk = 0;
+              while (true) {
+                if (cancelled) { reader.cancel(); throw new Error('cancelled'); }
+                const { done, value } = await reader.read();
+                if (done) break;
+                const byteLen = value.byteLength || value.length || 0;
+                // Write directly at the correct position — no buffering
+                await writable.write({ type: 'write', position: received, data: value });
+                received += byteLen;
+                wroteInThisChunk += byteLen;
+                if (total > 0) {
+                  const pct = Math.min(99, Math.round((received / total) * 100));
+                  updateTrayCard(cardId, pct, `Saving… ${pct}%`,
+                    `${formatBytes(received)} / ${formatBytes(total)}`);
+                } else {
+                  updateTrayCard(cardId, 99, 'Saving…', formatBytes(received));
+                }
+              }
+
+              chunkDone = true;
+              // If server ignored Range and sent full file (200 not 206), we're done
+              if (chunkRes.status === 200 && wroteInThisChunk > 0) { received = total || received; break; }
+
+            } catch (err) {
+              if (cancelled || err.message === 'cancelled') throw err;
+              chunkRetries++;
+              if (chunkRetries >= MAX_CHUNK_RETRIES) throw new Error(`Download failed after ${MAX_CHUNK_RETRIES} retries: ${err.message}`);
+              const pct = total > 0 ? Math.round((received / total) * 100) : 0;
+              updateTrayCard(cardId, pct,
+                `Connection lost. Retrying in 3s… (${chunkRetries}/${MAX_CHUNK_RETRIES})`,
+                total > 0 ? `${formatBytes(received)} / ${formatBytes(total)}` : formatBytes(received));
+              await new Promise(r => setTimeout(r, 3000));
             }
-
-            // Reassemble chunks into a single buffer
-            fileBytes = new Uint8Array(received);
-            let offset = 0;
-            for (const chunk of chunks) { fileBytes.set(chunk, offset); offset += chunk.byteLength || chunk.length || 0; }
-            break; // success — exit retry loop
-
-          } catch (err) {
-            if (cancelled || err.message === 'cancelled') throw err;
-            if (attempt === MAX_FILE_RETRIES) throw err;
-            updateTrayCard(cardId, 0,
-              `Connection lost. Retrying in 2s… (${attempt}/${MAX_FILE_RETRIES})`, '');
-            await new Promise(r => setTimeout(r, 2000));
           }
+
+          // If no total size known, one chunk = whole file
+          if (!total) break;
         }
 
-        // Write the complete buffer to disk in one shot
-        updateTrayCard(cardId, 99, 'Writing to disk…', '');
-        await writable.write(fileBytes);
         await writable.close();
         finishTrayCard(cardId, true, suggestedFilename);
         showToast(`Done: ${videoTitle.slice(0, 40)}`);

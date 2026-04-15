@@ -1358,7 +1358,8 @@ app.get("/api/download/status/:token", (req, res) => {
 });
 
 // GET /api/download/file/:token — stream the finished file.
-// File is deleted 60s after first serve so multiple devices can re-download within that window.
+// Supports Range requests (bytes=N-M or bytes=N-) for chunked/resumable downloads.
+// File is deleted 10 min after first serve to allow large chunked downloads to complete.
 app.get("/api/download/file/:token", (req, res) => {
   const token = String(req.params.token || "").trim();
   const job = jobs.get(token);
@@ -1371,20 +1372,48 @@ app.get("/api/download/file/:token", (req, res) => {
     return res.status(410).json({ error: "File has already been served or was cleaned up" });
   }
 
-  res.set({
+  const totalSize = job.fileSize || fs.statSync(job.filePath).size;
+
+  // Parse Range header: "bytes=N-" or "bytes=N-M"
+  const rangeHeader = req.headers["range"];
+  let start = 0;
+  let end = totalSize - 1;
+  let isPartial = false;
+
+  if (rangeHeader) {
+    const match = rangeHeader.match(/bytes=(\d+)-(\d*)/);
+    if (match) {
+      start = parseInt(match[1], 10);
+      end = match[2] ? parseInt(match[2], 10) : totalSize - 1;
+      if (start >= totalSize || end >= totalSize || start > end) {
+        res.set("Content-Range", `bytes */${totalSize}`);
+        return res.status(416).end();
+      }
+      isPartial = true;
+    }
+  }
+
+  const chunkSize = end - start + 1;
+
+  const headers = {
     "Content-Type": job.contentType,
     "Content-Disposition": buildContentDisposition(job.filename),
     "Cache-Control": "no-store",
-    "Content-Length": String(job.fileSize),
-  });
+    "Accept-Ranges": "bytes",
+    "Content-Length": String(chunkSize),
+  };
+  if (isPartial) headers["Content-Range"] = `bytes ${start}-${end}/${totalSize}`;
 
-  // Schedule cleanup 60s after the first serve — gives other devices time to download
+  res.set(headers);
+  if (isPartial) res.status(206);
+
+  // Schedule cleanup 10 min after first serve — large chunked downloads need the window
   if (!job.servedAt) {
     updateJob(token, { servedAt: Date.now() });
-    setTimeout(() => cleanupJob(token), 60 * 1000).unref();
+    setTimeout(() => cleanupJob(token), 10 * 60 * 1000).unref();
   }
 
-  const fileStream = fs.createReadStream(job.filePath);
+  const fileStream = fs.createReadStream(job.filePath, { start, end });
   fileStream.on("error", (err) => {
     if (!res.headersSent) res.status(500).json({ error: "File read failed: " + err.message });
     else res.destroy(err);

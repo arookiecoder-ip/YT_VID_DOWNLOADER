@@ -37,6 +37,29 @@ __pycache__/
 *.pyo
 *.pyd
 
+# Python environments and tooling
+.venv/
+venv/
+env/
+ENV/
+.python-version
+pip-wheel-metadata/
+
+# Python testing/type-check/cache
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# Packaging metadata
+*.egg-info/
+.eggs/
+
+# PyInstaller / executable outputs
+*.manifest
+*.spec.bak
+*.exe
+
 # Cache
 .cache/
 .npm/

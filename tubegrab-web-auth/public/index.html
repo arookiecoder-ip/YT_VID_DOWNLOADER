@@ -1114,6 +1114,14 @@
       }
     });
 
+    // Notify the user immediately when network goes down or comes back up.
+    window.addEventListener('offline', () => {
+      showToast('No internet connection — downloads will retry automatically', 'error');
+    });
+    window.addEventListener('online', () => {
+      showToast('Back online', 'success');
+    });
+
     (async () => {
       const el = document.getElementById('buildStamp');
       if (!el) return;
@@ -1610,13 +1618,13 @@
       let zipCompleted = 0;
       let zipFailed = 0;
       let cancelled = false;
-      const fetchAbort = new AbortController();
+      let currentFetchAbort = new AbortController(); // replaced on each retry attempt
 
-      // Cancel function: abort the fetch stream and tell the server to kill yt-dlp
+      // Cancel function: abort the current fetch attempt and tell the server to kill yt-dlp
       const cancelDownload = () => {
         if (cancelled) return;
         cancelled = true;
-        fetchAbort.abort();
+        currentFetchAbort.abort();
         navigator.sendBeacon(`${API_BASE}/api/download/playlist-zip/cancel/${progressId}`);
       };
 
@@ -1629,20 +1637,15 @@
       // Track this progress ID globally so pagehide can fire the cancel beacon
       activePlaylistProgressId = progressId;
 
-      try {
-        // Open SSE connection first so server can immediately send events
-        await new Promise((resolve, reject) => {
-          sse = new EventSource(`${API_BASE}/api/download/playlist-zip/progress/${progressId}`);
-          sse.onopen = () => resolve();
-          sse.onerror = () => reject(new Error('Could not open progress stream'));
-          setTimeout(resolve, 1500); // resolve anyway after 1.5s if onopen doesn't fire
-        });
+      // Helper: (re-)open SSE and attach all event listeners
+      const openSSE = () => {
+        if (sse) { sse.close(); sse = null; }
+        sse = new EventSource(`${API_BASE}/api/download/playlist-zip/progress/${progressId}`);
 
         sse.addEventListener('status', (e) => {
           const d = JSON.parse(e.data);
           updateTrayCard(cardId, 2, d.stage, `0 / ${total}`);
         });
-
         sse.addEventListener('downloading', (e) => {
           const d = JSON.parse(e.data);
           const pct = Math.round(((d.current - 1) / d.total) * 90);
@@ -1651,7 +1654,6 @@
             `"${d.title}"`
           );
         });
-
         sse.addEventListener('merging', (e) => {
           const d = JSON.parse(e.data);
           const pct = Math.round(((d.current - 1) / d.total) * 90);
@@ -1660,7 +1662,6 @@
             `"${d.title}"`
           );
         });
-
         sse.addEventListener('done', (e) => {
           const d = JSON.parse(e.data);
           zipCompleted = d.completed;
@@ -1671,7 +1672,6 @@
             : `${d.completed} / ${d.total} done`;
           updateTrayCard(cardId, pct, `Done ${d.current} / ${d.total}`, status);
         });
-
         sse.addEventListener('failed', (e) => {
           const d = JSON.parse(e.data);
           zipCompleted = d.completed;
@@ -1682,11 +1682,9 @@
             `${d.completed} done • ${d.failed} failed — "${d.title}"`
           );
         });
-
         sse.addEventListener('complete', () => {
           updateTrayCard(cardId, 92, 'Packing ZIP…', 'Finalising archive');
         });
-
         sse.addEventListener('zip-error', (e) => {
           try {
             const d = JSON.parse(e.data);
@@ -1694,45 +1692,77 @@
           } catch { }
         });
 
-        // Start the ZIP request (runs in parallel with SSE updates)
-        updateTrayCard(cardId, 1, 'Starting…', `0 / ${total}`);
-        const res = await fetch(`${API_BASE}/api/download/playlist-zip`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ url: currentVideo.url, formatId, ext, progressId }),
-          signal: fetchAbort.signal,
+        return new Promise((resolve) => {
+          sse.onopen = () => resolve();
+          setTimeout(resolve, 1500); // resolve anyway if onopen doesn't fire
         });
+      };
 
-        if (!res.ok) {
-          const err = await res.json().catch(() => ({}));
-          throw new Error(err.error || `Server error ${res.status}`);
+      const MAX_PLAYLIST_RETRIES = 3;
+      try {
+        for (let attempt = 1; attempt <= MAX_PLAYLIST_RETRIES; attempt++) {
+          if (cancelled) break;
+          try {
+            if (attempt > 1) {
+              updateTrayCard(cardId, 0, `Reconnecting… (attempt ${attempt}/${MAX_PLAYLIST_RETRIES})`, '');
+            }
+
+            // Open (or re-open) SSE so server can immediately send events
+            await openSSE();
+
+            // Fresh abort controller for this attempt
+            currentFetchAbort = new AbortController();
+
+            // Start the ZIP request (runs in parallel with SSE updates)
+            updateTrayCard(cardId, 1, 'Starting…', `0 / ${total}`);
+            const res = await fetch(`${API_BASE}/api/download/playlist-zip`, {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ url: currentVideo.url, formatId, ext, progressId }),
+              signal: currentFetchAbort.signal,
+            });
+
+            if (!res.ok) {
+              const errJson = await res.json().catch(() => ({}));
+              throw new Error(errJson.error || `Server error ${res.status}`);
+            }
+
+            updateTrayCard(cardId, 93, 'Receiving ZIP…', 'Downloading archive to your device');
+
+            // Extract filename from Content-Disposition header
+            let filename = playlistTitle + '.zip';
+            const cd = res.headers.get('Content-Disposition') || '';
+            const fnMatch = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';\r\n]+)/i);
+            if (fnMatch) filename = decodeURIComponent(fnMatch[1].trim().replace(/^["']|["']$/g, ''));
+
+            // showSaveFilePicker cannot be used here — it requires a synchronous user
+            // gesture, but we are already inside an async fetch continuation. Use the
+            // blob + anchor approach which works in all browsers.
+            const blob = await res.blob();
+            const objectUrl = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = objectUrl;
+            a.download = filename;
+            document.body.appendChild(a);
+            a.click();
+            setTimeout(() => { URL.revokeObjectURL(objectUrl); a.remove(); }, 1000);
+
+            const summary = zipFailed > 0
+              ? `${zipCompleted} downloaded, ${zipFailed} failed`
+              : `${total} videos packed`;
+            finishTrayCard(cardId, true, summary);
+            showToast(`Playlist ZIP ready: ${filename}`);
+            break; // success — exit retry loop
+
+          } catch (err) {
+            if (cancelled || err.name === 'AbortError') throw err;
+            if (attempt === MAX_PLAYLIST_RETRIES) throw err;
+            // Network error — wait then retry
+            updateTrayCard(cardId, 0,
+              `Connection lost. Retrying in 3s… (${attempt}/${MAX_PLAYLIST_RETRIES})`, '');
+            await new Promise(r => setTimeout(r, 3000));
+          }
         }
-
-        updateTrayCard(cardId, 93, 'Receiving ZIP…', 'Downloading archive to your device');
-
-        // Extract filename from Content-Disposition header
-        let filename = playlistTitle + '.zip';
-        const cd = res.headers.get('Content-Disposition') || '';
-        const fnMatch = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';\r\n]+)/i);
-        if (fnMatch) filename = decodeURIComponent(fnMatch[1].trim().replace(/^["']|["']$/g, ''));
-
-        // showSaveFilePicker cannot be used here — it requires a synchronous user
-        // gesture, but we are already inside an async fetch continuation. Use the
-        // blob + anchor approach which works in all browsers.
-        const blob = await res.blob();
-        const objectUrl = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = objectUrl;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        setTimeout(() => { URL.revokeObjectURL(objectUrl); a.remove(); }, 1000);
-
-        const summary = zipFailed > 0
-          ? `${zipCompleted} downloaded, ${zipFailed} failed`
-          : `${total} videos packed`;
-        finishTrayCard(cardId, true, summary);
-        showToast(`Playlist ZIP ready: ${filename}`);
       } catch (err) {
         if (cancelled || err.name === 'AbortError') {
           finishTrayCard(cardId, false, 'Cancelled');
@@ -1964,7 +1994,7 @@
         await new Promise((resolve, reject) => {
           const startedAt = Date.now();
           const MAX_ELAPSED_MS = 30 * 60 * 1000;
-          const MAX_CONSECUTIVE_FAILURES = 5;
+          const MAX_CONSECUTIVE_FAILURES = 20;
           let consecutiveFailures = 0;
           let lastProgress = 0;
           let lastStage = 'Working…';
@@ -2004,9 +2034,10 @@
             } catch (err) {
               if (cancelled) { stop(); return reject(new Error('cancelled')); }
               consecutiveFailures += 1;
+              updateTrayCard(cardId, lastProgress, `Reconnecting… (${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES})`, '');
               if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
                 stop();
-                return reject(new Error('Lost connection to server.'));
+                return reject(new Error('Lost connection to server after 20 retries.'));
               }
               setTimeout(poll, 3000);
             }
@@ -2014,37 +2045,65 @@
           poll();
         });
 
-        // Phase 3: stream the finished file to the writable
-        updateTrayCard(cardId, 100, 'Saving…', '');
-        fileStreamAbort = new AbortController();
-        const fileRes = await fetch(`${API_BASE}/api/download/file/${token}`, {
-          signal: fileStreamAbort.signal,
-        });
-        if (!fileRes.ok) {
-          const errData = await fileRes.json().catch(() => ({}));
-          throw new Error(errData.error || `File fetch failed (${fileRes.status})`);
-        }
+        // Phase 3: fetch file into memory with retry, then flush to disk in one shot.
+        // Buffering avoids partial-write issues if the network drops mid-stream — we
+        // can retry the fetch without needing to seek or reopen the file picker.
+        const MAX_FILE_RETRIES = 3;
+        let fileBytes = null;
 
-        const total = Number(fileRes.headers.get('Content-Length') || 0);
-        const reader = fileRes.body && fileRes.body.getReader ? fileRes.body.getReader() : null;
-        if (!reader) throw new Error('Streaming not supported in this browser.');
+        for (let attempt = 1; attempt <= MAX_FILE_RETRIES; attempt++) {
+          if (cancelled) throw new Error('cancelled');
+          try {
+            updateTrayCard(cardId, 0,
+              attempt > 1 ? `Reconnecting… (attempt ${attempt}/${MAX_FILE_RETRIES})` : 'Saving…', '');
+            fileStreamAbort = new AbortController();
+            const fileRes = await fetch(`${API_BASE}/api/download/file/${token}`, {
+              signal: fileStreamAbort.signal,
+            });
+            if (!fileRes.ok) {
+              const errData = await fileRes.json().catch(() => ({}));
+              throw new Error(errData.error || `File fetch failed (${fileRes.status})`);
+            }
 
-        let received = 0;
-        while (true) {
-          if (cancelled) { reader.cancel(); throw new Error('cancelled'); }
-          const { done, value } = await reader.read();
-          if (done) break;
-          await writable.write(value);
-          received += value.byteLength || value.length || 0;
-          if (total > 0) {
-            const pct = Math.min(100, Math.round((received / total) * 100));
-            updateTrayCard(cardId, pct, `Saving… ${pct}%`,
-              `${formatBytes(received)} / ${formatBytes(total)}`);
-          } else {
-            updateTrayCard(cardId, 99, 'Saving…', formatBytes(received));
+            const total = Number(fileRes.headers.get('Content-Length') || 0);
+            const reader = fileRes.body && fileRes.body.getReader ? fileRes.body.getReader() : null;
+            if (!reader) throw new Error('Streaming not supported in this browser.');
+
+            const chunks = [];
+            let received = 0;
+            while (true) {
+              if (cancelled) { reader.cancel(); throw new Error('cancelled'); }
+              const { done, value } = await reader.read();
+              if (done) break;
+              chunks.push(value);
+              received += value.byteLength || value.length || 0;
+              if (total > 0) {
+                const pct = Math.min(99, Math.round((received / total) * 100));
+                updateTrayCard(cardId, pct, `Saving… ${pct}%`,
+                  `${formatBytes(received)} / ${formatBytes(total)}`);
+              } else {
+                updateTrayCard(cardId, 99, 'Saving…', formatBytes(received));
+              }
+            }
+
+            // Reassemble chunks into a single buffer
+            fileBytes = new Uint8Array(received);
+            let offset = 0;
+            for (const chunk of chunks) { fileBytes.set(chunk, offset); offset += chunk.byteLength || chunk.length || 0; }
+            break; // success — exit retry loop
+
+          } catch (err) {
+            if (cancelled || err.message === 'cancelled') throw err;
+            if (attempt === MAX_FILE_RETRIES) throw err;
+            updateTrayCard(cardId, 0,
+              `Connection lost. Retrying in 2s… (${attempt}/${MAX_FILE_RETRIES})`, '');
+            await new Promise(r => setTimeout(r, 2000));
           }
         }
 
+        // Write the complete buffer to disk in one shot
+        updateTrayCard(cardId, 99, 'Writing to disk…', '');
+        await writable.write(fileBytes);
         await writable.close();
         finishTrayCard(cardId, true, suggestedFilename);
         showToast(`Done: ${videoTitle.slice(0, 40)}`);

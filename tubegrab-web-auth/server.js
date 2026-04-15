@@ -1542,7 +1542,11 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
   if (progressId) zipProgressChannels.set("abort:" + progressId, { abort });
 
   // Detect client disconnect (tab closed, network drop, etc.)
-  res.on("close", () => abort("client disconnected"));
+  // A 30s grace period lets the client reconnect after a brief network blip before yt-dlp is killed.
+  let disconnectTimer = null;
+  res.on("close", () => {
+    disconnectTimer = setTimeout(() => abort("client disconnected"), 30 * 1000);
+  });
 
   // Helper: send SSE event if a progress channel is registered
   const emit = (event, data) => {

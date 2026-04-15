@@ -1085,8 +1085,8 @@
     let activePlaylistProgressId = null; // set while a playlist ZIP is in progress
 
     // When the page is closed/navigated away:
-    // 1. Warn the user if a download is active (beforeunload)
-    // 2. Fire a cancel beacon so the server kills yt-dlp and deletes temp files (pagehide)
+    // 1. Warn the user if a download is active (beforeunload — desktop only, not mobile)
+    // 2. Fire a cancel beacon so the server kills yt-dlp and deletes temp files (pagehide, only on true unload)
     window.addEventListener('beforeunload', e => {
       if (activeDownloads > 0 || activePlaylistProgressId) {
         // returnValue must be a non-empty string — Chrome ignores empty string / e.preventDefault() alone
@@ -1095,13 +1095,22 @@
       }
     });
 
-    // pagehide fires reliably on tab close, navigation, and mobile backgrounding.
-    // sendBeacon is the only API guaranteed to complete after the page is gone.
-    window.addEventListener('pagehide', () => {
-      if (activePlaylistProgressId) {
+    // pagehide fires on tab close, navigation, AND mobile backgrounding (screen lock / app switch).
+    // event.persisted === true means the page entered bfcache (backgrounded, NOT destroyed).
+    // Only send the cancel beacon when the page is truly unloading (persisted === false).
+    window.addEventListener('pagehide', (event) => {
+      if (activePlaylistProgressId && !event.persisted) {
         navigator.sendBeacon(
           `${API_BASE}/api/download/playlist-zip/cancel/${activePlaylistProgressId}`
         );
+      }
+    });
+
+    // When the user returns to the page from bfcache (e.g. unlocks screen, switches back),
+    // the SSE connection and fetch stream are dead. Show a toast so they know to check status.
+    window.addEventListener('pageshow', (event) => {
+      if (event.persisted && activePlaylistProgressId) {
+        showToast('Download is still running on the server. Check your tray for progress.', 'success');
       }
     });
 
@@ -1917,12 +1926,14 @@
       // The main card is now free to be reused for a new video search.
       let token = null;
       let cancelled = false;
+      let fileStreamAbort = null; // abort controller for Phase 3 file stream
       const cancelDownload = () => {
         if (cancelled) return;
         cancelled = true;
         if (token) {
           fetch(`${API_BASE}/api/download/cancel/${token}`, { method: 'POST' }).catch(() => { });
         }
+        if (fileStreamAbort) fileStreamAbort.abort();
       };
       const cardId = createTrayCard(videoTitle, suggestedFilename, cancelDownload);
       activeDownloads++;
@@ -2005,7 +2016,10 @@
 
         // Phase 3: stream the finished file to the writable
         updateTrayCard(cardId, 100, 'Saving…', '');
-        const fileRes = await fetch(`${API_BASE}/api/download/file/${token}`);
+        fileStreamAbort = new AbortController();
+        const fileRes = await fetch(`${API_BASE}/api/download/file/${token}`, {
+          signal: fileStreamAbort.signal,
+        });
         if (!fileRes.ok) {
           const errData = await fileRes.json().catch(() => ({}));
           throw new Error(errData.error || `File fetch failed (${fileRes.status})`);
@@ -2017,6 +2031,7 @@
 
         let received = 0;
         while (true) {
+          if (cancelled) { reader.cancel(); throw new Error('cancelled'); }
           const { done, value } = await reader.read();
           if (done) break;
           await writable.write(value);

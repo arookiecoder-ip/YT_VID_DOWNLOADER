@@ -146,7 +146,7 @@ If running behind nginx/Caddy/a reverse proxy, set `TRUST_PROXY=1`.
 | `GLOBAL_RATE_LIMIT_MAX` | `120` | Max requests per IP per global window. |
 | `DOWNLOAD_RATE_LIMIT_MAX` | `8` | Max direct stream requests per IP per minute. |
 | `DOWNLOAD_START_RATE_LIMIT_MAX` | `60` | Max job-start requests per IP per minute. |
-| `MAX_PLAYLIST_ENTRIES` | `50` | Maximum playlist entries returned by `/api/info`. |
+| `MAX_PLAYLIST_ENTRIES` | `500` | Maximum playlist entries returned by `/api/info`. |
 | `MAX_CONCURRENT_JOBS` | `25` | Maximum active background download jobs across all clients. |
 | `PLAYLIST_CONCURRENCY` | `3` | Parallel yt-dlp processes per playlist ZIP download. |
 | `MAX_JOBS_PER_IP` | `5` | Max concurrent pending jobs allowed per client IP. |

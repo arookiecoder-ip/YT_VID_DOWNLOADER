@@ -108,8 +108,12 @@ if (NODE_ENV === "production") {
 function safeEqualString(a, b) {
   const left = Buffer.from(String(a || ""));
   const right = Buffer.from(String(b || ""));
-  if (left.length !== right.length) return false;
-  return crypto.timingSafeEqual(left, right);
+  // Pad both buffers to the same length before comparing so the early-return
+  // on length mismatch doesn't leak credential length via timing side-channel.
+  const maxLen = Math.max(left.length, right.length);
+  const paddedLeft = Buffer.concat([left, Buffer.alloc(maxLen - left.length)]);
+  const paddedRight = Buffer.concat([right, Buffer.alloc(maxLen - right.length)]);
+  return crypto.timingSafeEqual(paddedLeft, paddedRight) && left.length === right.length;
 }
 
 function sendAuthChallenge(res) {
@@ -1012,12 +1016,16 @@ app.get("/api/download-meta", async (req, res) => {
   const isAudio = ext === "mp3" || formatId === "bestaudio";
   const outputExt = isAudio ? "mp3" : ext || "mp4";
 
-  const sizeMeta = await probeDownloadSize(url, formatId, isAudio);
-  res.json({
-    sizeBytes: sizeMeta.bytes,
-    sizeExact: sizeMeta.exact,
-    ext: outputExt,
-  });
+  try {
+    const sizeMeta = await probeDownloadSize(url, formatId, isAudio);
+    res.json({
+      sizeBytes: sizeMeta.bytes,
+      sizeExact: sizeMeta.exact,
+      ext: outputExt,
+    });
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
 });
 
 // ── Job store ────────────────────────────────────────────────────────────────
@@ -1560,7 +1568,6 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
 
   // Abort controller — triggered when client disconnects or hits /cancel
   let aborted = false;
-  let currentProc = null; // tracks the most recently spawned yt-dlp (for abort signalling)
   const activeProcs = new Set(); // all running yt-dlp processes for this job
   const abort = (reason = "cancelled") => {
     if (aborted) return;
@@ -1577,7 +1584,10 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
   // 5 min grace period — mobile browsers can background for several minutes.
   let disconnectTimer = null;
   res.on("close", () => {
-    disconnectTimer = setTimeout(() => abort("client disconnected"), 5 * 60 * 1000);
+    // Only abort on unexpected disconnect — not on normal response completion.
+    if (!res.writableEnded) {
+      disconnectTimer = setTimeout(() => abort("client disconnected"), 5 * 60 * 1000);
+    }
   });
 
   // Helper: send SSE event if a progress channel is registered
@@ -1695,7 +1705,6 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
       const args = withCookies(buildDownloadArgs(formatId, isAudio, needsMerge ? tempPath : "-"));
       args.push(entry.url);
       const proc = spawn(YT_DLP, args, { stdio: ["ignore", needsMerge ? "ignore" : "pipe", "pipe"] });
-      currentProc = proc;
       activeProcs.add(proc);
 
       let stderrBuf = "";
@@ -1853,6 +1862,7 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
 
     emit("complete", { total, completed, failed });
     closeProgress();
+    clearTimeout(disconnectTimer); // normal completion — cancel any pending abort
 
     if (aborted) {
       try { fs.unlinkSync(zipTempPath); } catch {}
@@ -1861,6 +1871,10 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
 
     // Serve the finished ZIP with Range support so clients can resume on reconnect
     const zipFilename = playlistTitle + ".zip";
+
+    // Stat the file first — zipTotalSize must be known before registering in the store
+    const zipStat = fs.statSync(zipTempPath);
+    const zipTotalSize = zipStat.size;
 
     // Register in store so the client can re-fetch via GET /api/download/playlist-zip/file/:id
     if (progressId) {
@@ -1876,8 +1890,6 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
         if (entry) { try { fs.unlinkSync(entry.path); } catch {} zipFileStore.delete(progressId); }
       }, 30 * 60 * 1000).unref();
     }
-    const zipStat = fs.statSync(zipTempPath);
-    const zipTotalSize = zipStat.size;
 
     const rangeHeader = req.headers["range"];
     let start = 0;

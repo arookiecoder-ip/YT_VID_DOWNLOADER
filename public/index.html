@@ -1933,34 +1933,73 @@
             const fnMatch = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';\r\n]+)/i);
             if (fnMatch) filename = decodeURIComponent(fnMatch[1].trim().replace(/^["']|["']$/g, ''));
 
-            // Stream ZIP to blob in chunks (avoids buffering entire file in RAM)
-            // then trigger browser download via object URL
+            // Stream ZIP directly to disk via File System Access API (no RAM buffering).
+            // Falls back to a streaming fetch → anchor download if the API is unavailable.
             const zipTotal = Number(res.headers.get('Content-Length') || 0);
-            const zipReader = res.body.getReader();
-            const zipChunks = [];
-            let zipReceived = 0;
-            while (true) {
-              if (cancelled) { zipReader.cancel(); throw new Error('cancelled'); }
-              const { done, value } = await zipReader.read();
-              if (done) break;
-              zipChunks.push(value);
-              zipReceived += value.byteLength || 0;
-              if (zipTotal > 0) {
-                const pct = 93 + Math.round((zipReceived / zipTotal) * 6);
-                updateTrayCard(cardId, Math.min(99, pct), 'Receiving ZIP…',
-                  `${formatBytes(zipReceived)} / ${formatBytes(zipTotal)}`);
-              } else {
-                updateTrayCard(cardId, 97, 'Receiving ZIP…', formatBytes(zipReceived));
+
+            if (typeof window.showSaveFilePicker === 'function') {
+              // Use File System Access API — writes chunks directly to disk, no RAM spike
+              let zipWritable = null;
+              try {
+                const zipHandle = await window.showSaveFilePicker({
+                  suggestedName: filename,
+                  types: [{ description: 'ZIP archive', accept: { 'application/zip': ['.zip'] } }],
+                });
+                zipWritable = await zipHandle.createWritable();
+                const zipReader = res.body.getReader();
+                let zipReceived = 0;
+                while (true) {
+                  if (cancelled) { zipReader.cancel(); throw new Error('cancelled'); }
+                  const { done, value } = await zipReader.read();
+                  if (done) break;
+                  await zipWritable.write(value);
+                  zipReceived += value.byteLength || 0;
+                  if (zipTotal > 0) {
+                    const pct = 93 + Math.round((zipReceived / zipTotal) * 6);
+                    updateTrayCard(cardId, Math.min(99, pct), 'Saving ZIP…',
+                      `${formatBytes(zipReceived)} / ${formatBytes(zipTotal)}`);
+                  } else {
+                    updateTrayCard(cardId, 97, 'Saving ZIP…', formatBytes(zipReceived));
+                  }
+                }
+                await zipWritable.close();
+              } catch (err) {
+                if (zipWritable) { try { await zipWritable.abort(); } catch (_) {} }
+                if (err && err.name === 'AbortError') throw new Error('cancelled');
+                throw err;
               }
+            } else {
+              // Fallback: stream response body into a ReadableStream → Blob URL anchor.
+              // We still avoid buffering the whole file at once by using a TransformStream
+              // that pipes directly to a Blob constructed from the stream.
+              // Note: on browsers without File System Access API this still buffers in RAM,
+              // but it's the best we can do without the API.
+              const zipReader = res.body.getReader();
+              const zipChunks = [];
+              let zipReceived = 0;
+              while (true) {
+                if (cancelled) { zipReader.cancel(); throw new Error('cancelled'); }
+                const { done, value } = await zipReader.read();
+                if (done) break;
+                zipChunks.push(value);
+                zipReceived += value.byteLength || 0;
+                if (zipTotal > 0) {
+                  const pct = 93 + Math.round((zipReceived / zipTotal) * 6);
+                  updateTrayCard(cardId, Math.min(99, pct), 'Receiving ZIP…',
+                    `${formatBytes(zipReceived)} / ${formatBytes(zipTotal)}`);
+                } else {
+                  updateTrayCard(cardId, 97, 'Receiving ZIP…', formatBytes(zipReceived));
+                }
+              }
+              const blob = new Blob(zipChunks, { type: 'application/zip' });
+              const objectUrl = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = objectUrl;
+              a.download = filename;
+              document.body.appendChild(a);
+              a.click();
+              setTimeout(() => { URL.revokeObjectURL(objectUrl); a.remove(); }, 1000);
             }
-            const blob = new Blob(zipChunks, { type: 'application/zip' });
-            const objectUrl = URL.createObjectURL(blob);
-            const a = document.createElement('a');
-            a.href = objectUrl;
-            a.download = filename;
-            document.body.appendChild(a);
-            a.click();
-            setTimeout(() => { URL.revokeObjectURL(objectUrl); a.remove(); }, 1000);
 
             const summary = zipFailed > 0
               ? `${zipCompleted} downloaded, ${zipFailed} failed`
@@ -2047,15 +2086,16 @@
       const urlRe = /https?:\/\/[^\s"'<>]+/g;
       const seen = new Set();
       const out = [];
+      let playlistCount = 0;
       for (const raw of (text.match(urlRe) || [])) {
         const clean = raw.replace(/[.,;:!?)]+$/, '');
         if (seen.has(clean)) continue;
         if (!isValidYouTubeURL(clean)) continue;
-        if (isPlaylistURL(clean)) continue; // skip playlists
+        if (isPlaylistURL(clean)) { playlistCount++; continue; } // skip playlists, count them
         seen.add(clean);
         out.push(clean);
       }
-      return out;
+      return { urls: out, playlistCount };
     }
 
     // Wire textarea input listener after DOM is ready
@@ -2066,23 +2106,31 @@
 
     function updateBatchHint() {
       const text = document.getElementById('batchInput').value;
-      const urls = extractYouTubeURLs(text);
+      const { urls, playlistCount } = extractYouTubeURLs(text);
       const hint = document.getElementById('batchHint');
       if (!text.trim()) {
         hint.innerHTML = 'Paste text containing YouTube URLs';
-      } else if (urls.length === 0) {
+      } else if (urls.length === 0 && playlistCount === 0) {
         hint.innerHTML = 'No YouTube video links found';
+      } else if (urls.length === 0 && playlistCount > 0) {
+        hint.innerHTML = `No video links found — ${playlistCount} playlist link${playlistCount > 1 ? 's' : ''} detected (use main input for playlists)`;
       } else {
-        hint.innerHTML = `<span>${urls.length}</span> link${urls.length > 1 ? 's' : ''} found`;
+        let msg = `<span>${urls.length}</span> link${urls.length > 1 ? 's' : ''} found`;
+        if (playlistCount > 0) msg += ` · ${playlistCount} playlist${playlistCount > 1 ? 's' : ''} skipped (use main input)`;
+        hint.innerHTML = msg;
       }
     }
 
     async function startBatchDownload() {
       const text = document.getElementById('batchInput').value;
-      const urls = extractYouTubeURLs(text);
+      const { urls, playlistCount } = extractYouTubeURLs(text);
 
       if (urls.length === 0) {
-        showToast('No YouTube video links found in the pasted text', 'error');
+        if (playlistCount > 0) {
+          showToast(`Batch mode only supports individual videos. Paste the playlist URL in the main input instead.`, 'error');
+        } else {
+          showToast('No YouTube video links found in the pasted text', 'error');
+        }
         return;
       }
 
@@ -2112,7 +2160,8 @@
         if (!infoRes.ok) throw new Error(info.error || 'Failed to fetch info');
 
         if (info.kind === 'playlist') {
-          finishTrayCard(cardId, false, 'Skipped — playlist link');
+          // Playlist URLs are not supported in batch mode — explain clearly
+          finishTrayCard(cardId, false, 'Playlist links not supported in batch mode. Use the main input instead.');
           activeDownloads = Math.max(0, activeDownloads - 1);
           return;
         }
@@ -2126,15 +2175,19 @@
 
         updateTrayCard(cardId, 10, 'Starting download…', suggestedFilename);
 
-        // Start the download job on the server via the job queue
-        // then poll until done, then trigger browser download via job file endpoint
+        // jobToken is set once the server accepts the job.
+        // cancelDownload kills the server-side yt-dlp process via the cancel endpoint.
+        let jobToken = null;
         let cancelled = false;
         const cancelDownload = () => {
           if (cancelled) return;
           cancelled = true;
+          if (jobToken) {
+            fetch(`${API_BASE}/api/download/cancel/${jobToken}`, { method: 'POST' }).catch(() => {});
+          }
         };
 
-        // Replace dismiss button with cancel
+        // Wire up the cancel button on the tray card now that we have cancelDownload
         const dismissBtn = document.getElementById(`${cardId}-btn`);
         const confirmRow = document.getElementById(`${cardId}-confirm`);
         const yesBtn = document.getElementById(`${cardId}-yes`);
@@ -2148,11 +2201,10 @@
             if (confirmRow) confirmRow.style.display = 'flex';
           });
         }
-        if (yesBtn) yesBtn.addEventListener('click', () => { cancelDownload(); confirmRow.style.display = 'none'; });
-        if (noBtn) noBtn.addEventListener('click', () => { dismissBtn.style.display = ''; confirmRow.style.display = 'none'; });
+        if (yesBtn) yesBtn.addEventListener('click', () => { cancelDownload(); if (confirmRow) confirmRow.style.display = 'none'; });
+        if (noBtn) noBtn.addEventListener('click', () => { if (dismissBtn) dismissBtn.style.display = ''; if (confirmRow) confirmRow.style.display = 'none'; });
 
-        // Start job
-        let jobToken = null;
+        // Start job on server
         try {
           const startRes = await fetch(`${API_BASE}/api/download/start`, {
             method: 'POST',
@@ -2238,6 +2290,8 @@
       showError('');
       showResult(false);
       document.getElementById('featuresGrid').style.display = '';
+      const existingWarning = document.getElementById('playlistTruncatedWarning');
+      if (existingWarning) existingWarning.remove();
       __syncClearBtn();
     }
 
@@ -2273,7 +2327,7 @@
       document.getElementById('videoTitle').textContent = video.title;
       document.getElementById('channelName').textContent = video.channel;
       document.getElementById('viewCount').textContent = isPlaylist
-        ? `${playlistCount} videos`
+        ? `${playlistCount} videos${video.truncated ? ` (first ${playlistCount} shown)` : ''}`
         : formatViews(video.views);
       document.getElementById('duration').textContent = isPlaylist
         ? `${playlistCount} items`
@@ -2281,6 +2335,19 @@
       document.getElementById('uploadDate').textContent = isPlaylist
         ? 'Playlist'
         : (video.uploadDate || '—');
+
+      // Show a warning banner if the playlist was truncated
+      const existingWarning = document.getElementById('playlistTruncatedWarning');
+      if (existingWarning) existingWarning.remove();
+      if (isPlaylist && video.truncated) {
+        const totalLabel = video.totalCount ? ` of ${video.totalCount}` : '';
+        const warning = document.createElement('div');
+        warning.id = 'playlistTruncatedWarning';
+        warning.style.cssText = 'margin: 0 24px 16px; padding: 10px 14px; background: rgba(255,102,51,0.08); border: 1px solid rgba(255,102,51,0.25); border-radius: 8px; font-size: 0.78rem; color: #ff9966; line-height: 1.5;';
+        warning.textContent = `⚠ Only the first ${playlistCount}${totalLabel} videos are shown. The playlist may be longer — only these ${playlistCount} will be downloaded.`;
+        const formatSection = document.querySelector('.format-section');
+        if (formatSection) formatSection.parentNode.insertBefore(warning, formatSection);
+      }
       const dlBtn = document.getElementById('downloadBtn');
       dlBtn.querySelector('span').textContent = getDefaultDownloadButtonLabel();
       dlBtn.disabled = false; // re-enable in case a playlist download was in progress for a previous search

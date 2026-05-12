@@ -918,7 +918,10 @@ app.get("/api/info", async (req, res) => {
 
   try {
     if (isPlaylistURL(url)) {
-      const rawPlaylist = await runYtDlp([
+      // Use a tighter execFile timeout for flat-playlist fetches — they should be fast.
+      // runYtDlpRaw uses 120 s by default; for large playlists that can still hang.
+      // We wrap in a race so the HTTP request fails cleanly after 90 s.
+      const playlistFetchPromise = runYtDlp([
         "--dump-single-json",
         "--flat-playlist",
         "--no-warnings",
@@ -927,16 +930,21 @@ app.get("/api/info", async (req, res) => {
         String(MAX_PLAYLIST_ENTRIES),
         url,
       ]);
-      const playlist = JSON.parse(rawPlaylist);
-      const entries = normalizePlaylistEntries(playlist.entries || []).slice(
-        0,
-        MAX_PLAYLIST_ENTRIES,
+      const timeoutPromise = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("Playlist info fetch timed out after 90 seconds.")), 90000)
       );
+      const rawPlaylist = await Promise.race([playlistFetchPromise, timeoutPromise]);
+      const playlist = JSON.parse(rawPlaylist);
+      const allEntries = normalizePlaylistEntries(playlist.entries || []);
+      const truncated = allEntries.length >= MAX_PLAYLIST_ENTRIES;
+      const entries = allEntries.slice(0, MAX_PLAYLIST_ENTRIES);
 
       if (!entries.length) {
-        return res.status(400).json({
-          error: "Playlist found, but no downloadable entries were detected.",
-        });
+        // Distinguish between private/empty and truly not found
+        const errMsg = /private|unavailable|sign in/i.test(rawPlaylist)
+          ? "This playlist is private or unavailable. Sign in with cookies to access it."
+          : "Playlist found, but no downloadable entries were detected. It may be empty or region-locked.";
+        return res.status(400).json({ error: errMsg });
       }
 
       const playlistFormats = getFallbackFormats(true);
@@ -957,6 +965,8 @@ app.get("/api/info", async (req, res) => {
         uploadDate: null,
         thumbnail: playlist.thumbnail || firstThumb,
         playlistCount: entries.length,
+        truncated,          // true when playlist has more videos than MAX_PLAYLIST_ENTRIES
+        totalCount: playlist.playlist_count || null,
         entries,
         formats: playlistFormats,
       });
@@ -1613,7 +1623,7 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
   try {
     emit("status", { stage: "Fetching playlist info…", current: 0, total: 0 });
 
-    const rawPlaylist = await runYtDlp([
+    const playlistInfoPromise = runYtDlp([
       "--dump-single-json",
       "--flat-playlist",
       "--no-warnings",
@@ -1622,6 +1632,10 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
       String(MAX_PLAYLIST_ENTRIES),
       url,
     ]);
+    const playlistInfoTimeout = new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("Playlist info fetch timed out after 90 seconds.")), 90000)
+    );
+    const rawPlaylist = await Promise.race([playlistInfoPromise, playlistInfoTimeout]);
     const playlist = JSON.parse(rawPlaylist);
     entries = normalizePlaylistEntries(playlist.entries || []).slice(0, MAX_PLAYLIST_ENTRIES);
     if (!entries.length) {
@@ -1709,8 +1723,17 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
 
       let stderrBuf = "";
       let mergeStarted = false;
+      // Per-video watchdog: kill yt-dlp if it produces no output for DOWNLOAD_WATCHDOG_MS
+      let lastActivityAt = Date.now();
+      const entryWatchdog = setInterval(() => {
+        if (Date.now() - lastActivityAt > DOWNLOAD_WATCHDOG_MS) {
+          console.warn("[playlist-zip] watchdog: killing stalled yt-dlp for", entry.url);
+          try { proc.kill("SIGKILL"); } catch {}
+        }
+      }, DOWNLOAD_WATCHDOG_TICK_MS);
 
       proc.stderr.on("data", (d) => {
+        lastActivityAt = Date.now();
         const line = d.toString().trim();
         if (line) {
           stderrBuf += line + "\n";
@@ -1726,20 +1749,24 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
         // For single-stream, collect stdout into a temp file so parallel downloads
         // don't interleave — each finishes independently then gets appended in order
         const writeStream = fs.createWriteStream(tempPath);
+        proc.stdout.on("data", () => { lastActivityAt = Date.now(); });
         proc.stdout.pipe(writeStream);
         writeStream.on("error", (err) => {
+          clearInterval(entryWatchdog);
           downloadDoneReject(err);
           mergeDoneReject(err);
         });
       }
 
       proc.on("error", (err) => {
+        clearInterval(entryWatchdog);
         activeProcs.delete(proc);
         downloadDoneReject(err);
         mergeDoneReject(err);
       });
 
       proc.on("close", (code) => {
+        clearInterval(entryWatchdog);
         activeProcs.delete(proc);
         if (aborted) {
           const err = new Error("cancelled");

@@ -25,6 +25,11 @@ services:
       - ./cookies.txt:/app/cookies.txt:ro
     restart: unless-stopped
     mem_limit: 1g
+    # Explicit DNS servers so the container can resolve external domains.
+    # Podman/Docker containers sometimes inherit broken DNS from the host.
+    dns:
+      - 8.8.8.8
+      - 1.1.1.1
 
 volumes:
   downloads:

@@ -34,6 +34,11 @@ const YT_DLP = (() => {
   }
 })();
 const YTDLP_COOKIES = process.env.YTDLP_COOKIES || "";
+// Set YTDLP_USE_NODE_RUNTIME=1 only if yt-dlp >= 2023.11 is installed.
+// Older versions don't recognise --js-runtimes and abort before fetching anything.
+const YTDLP_USE_NODE_RUNTIME =
+  String(process.env.YTDLP_USE_NODE_RUNTIME || "").trim() === "1" ||
+  String(process.env.YTDLP_USE_NODE_RUNTIME || "").trim().toLowerCase() === "true";
 const AUTH_USERNAME = process.env.AUTH_USERNAME || "admin";
 const AUTH_PASSWORD = process.env.AUTH_PASSWORD || "change-me-now";
 const AUTH_REALM = process.env.AUTH_REALM || "TubeGrab Protected";
@@ -435,7 +440,12 @@ function runYtDlpRaw(args) {
       args,
       { timeout: 120000, maxBuffer: 20 * 1024 * 1024 },
       (err, stdout, stderr) => {
-        if (err) return reject(new Error(extractUsefulError(stderr, err.message)));
+        if (err) {
+          // Log the raw stderr so operators can see the real yt-dlp error in docker logs
+          const stderrTrimmed = String(stderr || "").trim();
+          if (stderrTrimmed) console.error("[yt-dlp stderr]", stderrTrimmed.slice(0, 800));
+          return reject(new Error(extractUsefulError(stderr, err.message)));
+        }
         resolve(stdout.trim());
       },
     );
@@ -443,8 +453,11 @@ function runYtDlpRaw(args) {
 }
 
 async function runYtDlp(args) {
-  // Always include a socket timeout so yt-dlp doesn't hang on flaky connections
-  const baseArgs = ["--js-runtimes", "node", "--socket-timeout", "30", ...withCookies(args)];
+  // Always include a socket timeout so yt-dlp doesn't hang on flaky connections.
+  // --js-runtimes node is only added when YTDLP_USE_NODE_RUNTIME=1 — older yt-dlp
+  // versions don't recognise this flag and abort immediately with an error.
+  const runtimeFlag = YTDLP_USE_NODE_RUNTIME ? ["--js-runtimes", "node"] : [];
+  const baseArgs = [...runtimeFlag, "--socket-timeout", "30", ...withCookies(args)];
   try {
     return await runYtDlpRaw(baseArgs);
   } catch (err) {
@@ -466,7 +479,7 @@ async function runYtDlp(args) {
     // Retry with tv_embedded player client as fallback for n-challenge
     console.warn("[yt-dlp] n-challenge detected, retrying with tv_embedded…");
     const fallbackArgs = [
-      "--js-runtimes", "node",
+      ...runtimeFlag,
       "--socket-timeout", "30",
       "--extractor-args", "youtube:player_client=tv_embedded",
       ...withCookies(args),
@@ -868,8 +881,9 @@ async function probeDownloadSize(url, formatId, isAudio) {
 
 function buildDownloadArgs(formatId, isAudio, outputTarget = "-") {
   const selector = getFormatSelector(formatId, isAudio);
+  const runtimeFlag = YTDLP_USE_NODE_RUNTIME ? ["--js-runtimes", "node"] : [];
   const args = [
-    "--js-runtimes", "node",
+    ...runtimeFlag,
     "--no-warnings",
     "--no-playlist",
     "--no-check-certificates",

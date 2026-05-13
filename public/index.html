@@ -1949,6 +1949,21 @@
       const total = selectedEntryList.length;
       const btn = document.getElementById('downloadBtn');
 
+      // Pre-open the file picker NOW — must happen within the user gesture (before any await).
+      // After the first await the gesture context is lost and showSaveFilePicker throws SecurityError.
+      let zipFileHandle = null;
+      if (typeof window.showSaveFilePicker === 'function') {
+        try {
+          zipFileHandle = await window.showSaveFilePicker({
+            suggestedName: sanitizeClientFilename(playlistTitle) + '.zip',
+            types: [{ description: 'ZIP archive', accept: { 'application/zip': ['.zip'] } }],
+          });
+        } catch (err) {
+          if (err && err.name === 'AbortError') return; // user cancelled picker — nothing to undo
+          zipFileHandle = null; // any other failure → fall back to blob anchor
+        }
+      }
+
       // Generate a random progress ID and open SSE channel before starting the ZIP request
       const progressId = Array.from(crypto.getRandomValues(new Uint8Array(16)))
         .map(b => b.toString(16).padStart(2, '0')).join('');
@@ -2081,19 +2096,14 @@
             const fnMatch = cd.match(/filename\*?=(?:UTF-8'')?["']?([^"';\r\n]+)/i);
             if (fnMatch) filename = decodeURIComponent(fnMatch[1].trim().replace(/^["']|["']$/g, ''));
 
-            // Stream ZIP directly to disk via File System Access API (no RAM buffering).
-            // Falls back to a streaming fetch → anchor download if the API is unavailable.
+            // Stream ZIP to disk. Uses the pre-obtained file handle if available (no RAM spike),
+            // otherwise falls back to accumulating chunks into a Blob anchor download.
             const zipTotal = Number(res.headers.get('Content-Length') || 0);
 
-            if (typeof window.showSaveFilePicker === 'function') {
-              // Use File System Access API — writes chunks directly to disk, no RAM spike
+            if (zipFileHandle) {
               let zipWritable = null;
               try {
-                const zipHandle = await window.showSaveFilePicker({
-                  suggestedName: filename,
-                  types: [{ description: 'ZIP archive', accept: { 'application/zip': ['.zip'] } }],
-                });
-                zipWritable = await zipHandle.createWritable();
+                zipWritable = await zipFileHandle.createWritable();
                 const zipReader = res.body.getReader();
                 let zipReceived = 0;
                 while (true) {

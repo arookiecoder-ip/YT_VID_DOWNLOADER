@@ -1901,6 +1901,9 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
     await Promise.all(entryPromises);
     // Wait for all archive appends to finish
     await archiveLock;
+    // Preserve the output ZIP — remove it from the cleanup set so cleanupTempFiles()
+    // only wipes individual video temp files. The ZIP is deleted after being served.
+    tempFiles.delete(zipTempPath);
     cleanupTempFiles();
 
     if (aborted) {

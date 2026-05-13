@@ -1583,6 +1583,9 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
   const formatId = String(source.formatId || "best").trim();
   const ext = String(source.ext || "mp4").trim().toLowerCase();
   const progressId = String(source.progressId || "").trim();
+  // Optional: pre-selected entries from the client (skips re-fetching the full playlist)
+  const selectedEntries = Array.isArray(source.selectedEntries) ? source.selectedEntries : null;
+  const clientPlaylistTitle = String(source.playlistTitle || "").trim().slice(0, 200);
 
   if (!url || !isPlaylistURL(url)) {
     return res.status(400).json({ error: "Invalid or missing playlist URL" });
@@ -1634,32 +1637,45 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
   };
 
   let entries;
+  let playlistTitle;
   try {
-    emit("status", { stage: "Fetching playlist info…", current: 0, total: 0 });
-
-    const playlistInfoPromise = runYtDlp([
-      "--dump-single-json",
-      "--flat-playlist",
-      "--no-warnings",
-      "--yes-playlist",
-      "--playlist-end",
-      String(MAX_PLAYLIST_ENTRIES),
-      url,
-    ]);
-    const playlistInfoTimeout = new Promise((_, reject) =>
-      setTimeout(() => reject(new Error("Playlist info fetch timed out after 90 seconds.")), 90000)
-    );
-    const rawPlaylist = await Promise.race([playlistInfoPromise, playlistInfoTimeout]);
-    const playlist = JSON.parse(rawPlaylist);
-    entries = normalizePlaylistEntries(playlist.entries || []).slice(0, MAX_PLAYLIST_ENTRIES);
-    if (!entries.length) {
-      closeProgress();
-      return res.status(400).json({ error: "Playlist has no downloadable entries." });
+    if (selectedEntries && selectedEntries.length > 0) {
+      // Client sent a pre-filtered selection — skip re-fetching the full playlist.
+      entries = selectedEntries
+        .filter(e => e && typeof e.url === "string" && isValidYouTubeURL(e.url))
+        .slice(0, MAX_PLAYLIST_ENTRIES)
+        .map(e => ({ url: e.url, title: String(e.title || "").trim() || null }));
+      if (!entries.length) {
+        closeProgress();
+        return res.status(400).json({ error: "No valid video URLs in the selection." });
+      }
+      playlistTitle = sanitizeFilename(clientPlaylistTitle || "Playlist Selection");
+    } else {
+      emit("status", { stage: "Fetching playlist info…", current: 0, total: 0 });
+      const playlistInfoPromise = runYtDlp([
+        "--dump-single-json",
+        "--flat-playlist",
+        "--no-warnings",
+        "--yes-playlist",
+        "--playlist-end",
+        String(MAX_PLAYLIST_ENTRIES),
+        url,
+      ]);
+      const playlistInfoTimeout = new Promise((_, reject) =>
+        setTimeout(() => reject(new Error("Playlist info fetch timed out after 90 seconds.")), 90000)
+      );
+      const rawPlaylist = await Promise.race([playlistInfoPromise, playlistInfoTimeout]);
+      const playlist = JSON.parse(rawPlaylist);
+      entries = normalizePlaylistEntries(playlist.entries || []).slice(0, MAX_PLAYLIST_ENTRIES);
+      if (!entries.length) {
+        closeProgress();
+        return res.status(400).json({ error: "Playlist has no downloadable entries." });
+      }
+      playlistTitle = sanitizeFilename(playlist.title || clientPlaylistTitle || "Playlist");
     }
 
     if (aborted) { closeProgress(); return res.destroy(); }
 
-    const playlistTitle = sanitizeFilename(playlist.title || "Playlist");
     const outputExt = isAudio ? "mp3" : "mp4";
     const total = entries.length;
 

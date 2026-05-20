@@ -9,7 +9,14 @@
       "type": "stdio",
       "autoApprove": [
         "query_graph_tool",
-        "get_minimal_context_tool"
+        "get_minimal_context_tool",
+        "build_or_update_graph_tool",
+        "semantic_search_nodes_tool",
+        "semantic_search_nodes_tool",
+        "list_graph_stats_tool",
+        "get_architecture_overview_tool",
+        "get_suggested_questions_tool",
+        "get_knowledge_gaps_tool"
       ]
     }
   }

@@ -105,8 +105,12 @@ if (NODE_ENV === "production") {
     throw new Error("[auth] Default credentials are not allowed in production.");
   }
 } else if (AUTH_USERNAME === "admin" && AUTH_PASSWORD === "change-me-now") {
+  // Fix 6: warn loudly in all non-production environments so accidental deploys
+  // with NODE_ENV unset are visible in logs. The server still starts — operators
+  // may intentionally run with defaults in a local/dev context.
   console.warn(
-    "[auth] Using default credentials. Set AUTH_USERNAME and AUTH_PASSWORD for production.",
+    "[auth] WARNING: Using default credentials (admin/change-me-now). " +
+    "Set AUTH_USERNAME and AUTH_PASSWORD before exposing this server to a network.",
   );
 }
 
@@ -370,6 +374,8 @@ function isPlaylistURL(url) {
   const info = parseYouTubeURL(url);
   if (!info) return false;
   if (info.isPlaylistPath && info.listId) return true;
+  // Fix 4: watch?v=X&list=Y URLs are intentionally treated as single-video downloads.
+  // Only a bare playlist URL (no videoId) is routed through the playlist path.
   return Boolean(info.listId) && !info.videoId;
 }
 
@@ -512,7 +518,8 @@ function checkBinary(binary, args = ["--version"]) {
 }
 
 function fmtBytes(bytes) {
-  if (!bytes) return "varies";
+  // Fix 10: treat null/undefined as unknown size; 0 is a valid (if unusual) value
+  if (bytes == null) return "varies";
   if (bytes >= 1e9) return (bytes / 1e9).toFixed(2) + " GB";
   if (bytes >= 1e6) return (bytes / 1e6).toFixed(1) + " MB";
   return (bytes / 1e3).toFixed(0) + " KB";
@@ -767,6 +774,8 @@ function sanitizeFilename(name) {
       .replace(/[\x00-\x1F\x7F]/g, "")
       .replace(/\s+/g, " ")
       .trim()
+      // Fix 9: strip leading dots to prevent hidden files on Linux/macOS
+      .replace(/^\.+/, "")
       .slice(0, 120) || "video"
   );
 }
@@ -1246,7 +1255,10 @@ function remuxMp4(inputPath) {
       removeFileQuietly(outputPath);
       reject(new Error("ffmpeg remux failed: " + stderr.slice(-300)));
     });
-    proc.on("error", reject);
+    proc.on("error", (err) => {
+      removeFileQuietly(outputPath);
+      reject(err);
+    });
   });
 }
 
@@ -1316,7 +1328,9 @@ async function runDownloadJob(token, url, formatId, isAudio) {
     const job = jobs.get(token);
     if (job && job.state === "cancelled") return; // already handled by cancel endpoint
     console.error("[job:" + token.slice(0, 6) + "] error:", err.message);
-    removeFileQuietly(producedPath);
+    // Fix 7: guard is explicit — producedPath is null when error occurs before performDownload
+    // resolves (e.g. during probeDownloadSize). removeFileQuietly already handles null safely.
+    if (producedPath) removeFileQuietly(producedPath);
     updateJob(token, {
       state: "error",
       stage: "Failed",
@@ -1463,9 +1477,8 @@ app.post("/api/download/cancel/:token", (req, res) => {
   // Kill the yt-dlp process immediately
   if (typeof job.killProc === "function") job.killProc();
 
-  // Mark as cancelled so runDownloadJob's catch block skips the error update
-  jobs.set(token, { ...job, state: "cancelled", stage: "Cancelled", killProc: null });
   console.log("[job:" + token.slice(0, 6) + "] cancelled by client");
+  cleanupJob(token);   // removes temp file + deletes job entry immediately
   res.status(204).end();
 });
 
@@ -1484,6 +1497,16 @@ async function streamDownload(req, res) {
   const isAudio = ext === "mp3" || formatId === "bestaudio";
   const contentType = isAudio ? "audio/mpeg" : "video/mp4";
   let producedPath = null;
+
+  // Fix 5: enforce duration/size limits on the legacy direct-download path,
+  // matching the same guard applied in /api/download/start.
+  if (MAX_DURATION_SECONDS || MAX_FILESIZE_BYTES) {
+    try {
+      await probeDownloadSize(url, formatId, isAudio);
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+  }
 
   try {
     const result = await performDownload(url, formatId, isAudio);
@@ -1531,6 +1554,9 @@ async function streamDownload(req, res) {
 // In-memory SSE progress channels for playlist ZIP jobs.
 // Key: progressId (random hex), Value: { send(event, data), close() }
 const zipProgressChannels = new Map();
+// Fix 8: separate Map for abort handles to avoid namespace collision with progress channels.
+// Key: progressId (random hex), Value: { abort(reason) }
+const zipAbortChannels = new Map();
 // Stores finished ZIP temp paths keyed by progressId for re-download after reconnect.
 // Entry: { path, filename, size, createdAt }
 const zipFileStore = new Map();
@@ -1605,7 +1631,7 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
   };
 
   // Register this job so /cancel can reach it
-  if (progressId) zipProgressChannels.set("abort:" + progressId, { abort });
+  if (progressId) zipAbortChannels.set(progressId, { abort });
 
   // Detect client disconnect (tab closed, network drop, mobile backgrounding etc.)
   // 5 min grace period — mobile browsers can background for several minutes.
@@ -1626,7 +1652,7 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
     const ch = zipProgressChannels.get(progressId);
     if (ch && ch.close) { ch.close(); }
     zipProgressChannels.delete(progressId);
-    zipProgressChannels.delete("abort:" + progressId);
+    zipAbortChannels.delete(progressId);
   };
 
   // Temp file tracker — cleaned up on abort or completion
@@ -1783,6 +1809,9 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
         proc.stdout.pipe(writeStream);
         writeStream.on("error", (err) => {
           clearInterval(entryWatchdog);
+          // Fix 1: clean up the partial temp file on write error to prevent leaks
+          removeFileQuietly(tempPath);
+          tempFiles.delete(tempPath);
           downloadDoneReject(err);
           mergeDoneReject(err);
         });
@@ -1791,6 +1820,9 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
       proc.on("error", (err) => {
         clearInterval(entryWatchdog);
         activeProcs.delete(proc);
+        // Fix 2: clean up the temp file when yt-dlp fails to spawn to prevent leaks
+        removeFileQuietly(tempPath);
+        tempFiles.delete(tempPath);
         downloadDoneReject(err);
         mergeDoneReject(err);
       });
@@ -1822,17 +1854,32 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
 
     // Add a completed temp file into the archive (serialised via archiveLock)
     const appendToArchive = ({ tempPath, filename, entry, index }) => {
-      archiveLock = archiveLock.then(() => new Promise((resolve) => {
+      archiveLock = archiveLock.then(() => new Promise((resolve, reject) => {
         if (aborted || !fs.existsSync(tempPath)) {
           try { fs.unlinkSync(tempPath); } catch {}
           tempFiles.delete(tempPath);
           return resolve();
         }
-        archive.once("entry", () => {
+        // Fix 3: pair a one-time error handler with the entry listener so that
+        // if archiver emits "error" instead of "entry" (e.g. the file disappears
+        // between existsSync and archive.file), archiveLock resolves rather than
+        // hanging forever and deadlocking the entire ZIP job.
+        const onEntry = () => {
+          archive.removeListener("error", onError);
           try { fs.unlinkSync(tempPath); } catch {}
           tempFiles.delete(tempPath);
           resolve();
-        });
+        };
+        const onError = (err) => {
+          archive.removeListener("entry", onEntry);
+          try { fs.unlinkSync(tempPath); } catch {}
+          tempFiles.delete(tempPath);
+          // Resolve (not reject) so the outer Promise.all continues and the
+          // archiver "error" event propagates to its own top-level handler.
+          resolve();
+        };
+        archive.once("entry", onEntry);
+        archive.once("error", onError);
         archive.file(tempPath, { name: filename });
       }));
       return archiveLock;
@@ -1944,11 +1991,14 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
         size: zipTotalSize,
         createdAt: Date.now(),
       });
-      // Auto-delete from store after 30 min
+      // Store-aware timer: cleans up store entry and file together
       setTimeout(() => {
         const entry = zipFileStore.get(progressId);
         if (entry) { try { fs.unlinkSync(entry.path); } catch {} zipFileStore.delete(progressId); }
       }, 30 * 60 * 1000).unref();
+    } else {
+      // No progressId — no store entry, but still need to schedule file deletion
+      setTimeout(() => { removeFileQuietly(zipTempPath); }, 30 * 60 * 1000).unref();
     }
 
     const rangeHeader = req.headers["range"];
@@ -2018,7 +2068,7 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
 app.post("/api/download/playlist-zip/cancel/:id", (req, res) => {
   const id = String(req.params.id || "").trim();
   if (!id || !/^[0-9a-f]{32}$/.test(id)) return res.status(400).end();
-  const abortHandle = zipProgressChannels.get("abort:" + id);
+  const abortHandle = zipAbortChannels.get(id);
   if (abortHandle) abortHandle.abort("cancel endpoint");
   res.status(204).end();
 });
@@ -2071,6 +2121,12 @@ app.get("/api/download/playlist-zip/file/:id", (req, res) => {
     else res.destroy(err);
   });
   stream.pipe(res);
+  if (!isPartial) {
+    res.on("finish", () => {
+      removeFileQuietly(entry.path);
+      zipFileStore.delete(id);
+    });
+  }
 });
 
 // GET /api/download — legacy direct stream (used by playlist iframe fallback)

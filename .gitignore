@@ -77,6 +77,8 @@ Thumbs.db
 
 # Local tooling settings
 .claude/
+.kiro/
+.kiro/settings
 
 # Docker local overrides
 docker-compose.override.yml

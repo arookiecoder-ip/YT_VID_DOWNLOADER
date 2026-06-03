@@ -197,6 +197,63 @@ function buildSaveProgressDetail(received, total, startedAt) {
   }
   return parts.join(' | ');
 }
+
+async function pipeResponseToWritable(res, writable, {
+  total = 0,
+  cancelled,
+  onProgress,
+}) {
+  const reader = res.body && res.body.getReader
+    ? res.body.getReader()
+    : null;
+  if (!reader) throw new Error('Streaming not supported in this browser.');
+
+  let received = 0;
+  const startedAt = Date.now();
+  while (true) {
+    if (cancelled && cancelled()) {
+      await reader.cancel();
+      throw new Error('cancelled');
+    }
+    const { done, value } = await reader.read();
+    if (done) break;
+    const byteLen = value.byteLength || value.length || 0;
+    await writable.write(value);
+    received += byteLen;
+    if (onProgress) onProgress(received, total, startedAt);
+  }
+  return received;
+}
+
+async function tryFastStreamDownload({
+  url,
+  formatId,
+  ext,
+  writable,
+  abortController,
+  knownBytes,
+  cancelled,
+  onProgress,
+}) {
+  const params = new URLSearchParams({ url, formatId, ext });
+  const res = await fetch(`${API_BASE}/api/download/stream?${params.toString()}`, {
+    signal: abortController.signal,
+  });
+
+  if (!res.ok) {
+    const errData = await res.json().catch(() => ({}));
+    const err = new Error(errData.error || `Fast stream failed (${res.status})`);
+    err.canFallback = res.status === 409 || errData.fallback === 'job';
+    throw err;
+  }
+
+  const total = Number(res.headers.get('Content-Length') || 0) || knownBytes || 0;
+  return pipeResponseToWritable(res, writable, {
+    total,
+    cancelled,
+    onProgress,
+  });
+}
 function sanitizeClientFilename(name) {
   return String(name || 'video')
     .replace(/[\\/:*?"<>|]/g, '')
@@ -1369,6 +1426,43 @@ async function startDownload() {
   try {
     writable = await fileHandle.createWritable();
 
+    if (selectedFmt.streamable && selectedFmt.streamFormatId) {
+      fileStreamAbort = new AbortController();
+      updateTrayCard(cardId, 5, 'Starting fast stream...', '');
+      try {
+        await tryFastStreamDownload({
+          url: currentVideo.url,
+          formatId: selectedFmt.streamFormatId,
+          ext,
+          writable,
+          abortController: fileStreamAbort,
+          knownBytes,
+          cancelled: () => cancelled,
+          onProgress: (received, total, startedAt) => {
+            if (total > 0) {
+              const pct = Math.min(99, Math.round((received / total) * 99));
+              updateTrayCard(cardId, pct, `Saving... ${pct}%`,
+                buildSaveProgressDetail(received, total, startedAt));
+            } else {
+              updateTrayCard(cardId, 50, 'Saving...', buildSaveProgressDetail(received, total, startedAt));
+            }
+          },
+        });
+        await writable.close();
+        writable = null;
+        finishTrayCard(cardId, true, suggestedFilename);
+        showToast(`Done: ${videoTitle.slice(0, 40)}`);
+        return;
+      } catch (err) {
+        fileStreamAbort = null;
+        if (cancelled || err.message === 'cancelled' || err.name === 'AbortError') {
+          throw new Error('cancelled');
+        }
+        if (!err.canFallback) throw err;
+        updateTrayCard(cardId, 2, 'Switching to reliable mode...', '');
+      }
+    }
+
     // Phase 1: start the background job — returns a token immediately
     // (well within Cloudflare's 100s proxy timeout).
     updateTrayCard(cardId, 2, 'Starting…', '');
@@ -1460,28 +1554,23 @@ async function startDownload() {
       throw new Error(errData.error || `File fetch failed (${fileRes.status})`);
     }
 
-    const reader = fileRes.body && fileRes.body.getReader
-      ? fileRes.body.getReader()
-      : null;
-    if (!reader) throw new Error('Streaming not supported in this browser.');
-    const saveStartedAt = Date.now();
-
-    while (true) {
-      if (cancelled) { reader.cancel(); throw new Error('cancelled'); }
-      const { done, value } = await reader.read();
-      if (done) break;
-      const byteLen = value.byteLength || value.length || 0;
-      await writable.write(value);
-      received += byteLen;
-      if (total > 0) {
-        const pct = Math.min(99, Math.round(90 + (received / total) * 9));
-        updateTrayCard(cardId, pct, `Saving... ${pct}%`,
-          buildSaveProgressDetail(received, total, saveStartedAt));
-      } else {
-        updateTrayCard(cardId, 99, 'Saving...', buildSaveProgressDetail(received, total, saveStartedAt));
-      }
-    }
+    await pipeResponseToWritable(fileRes, writable, {
+      total,
+      cancelled: () => cancelled,
+      onProgress: (bytesReceived, bytesTotal, saveStartedAt) => {
+        received = bytesReceived;
+        const effectiveTotal = bytesTotal || total;
+        if (effectiveTotal > 0) {
+          const pct = Math.min(99, Math.round(90 + (received / effectiveTotal) * 9));
+          updateTrayCard(cardId, pct, `Saving... ${pct}%`,
+            buildSaveProgressDetail(received, effectiveTotal, saveStartedAt));
+        } else {
+          updateTrayCard(cardId, 99, 'Saving...', buildSaveProgressDetail(received, effectiveTotal, saveStartedAt));
+        }
+      },
+    });
     await writable.close();
+    writable = null;
     finishTrayCard(cardId, true, suggestedFilename);
     showToast(`Done: ${videoTitle.slice(0, 40)}`);
   } catch (err) {

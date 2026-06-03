@@ -75,7 +75,8 @@ const DEBUG_API_ERRORS =
   String(process.env.DEBUG_API_ERRORS || "").trim().toLowerCase() === "true";
 const DOWNLOAD_WATCHDOG_MS = 180000;
 const DOWNLOAD_WATCHDOG_TICK_MS = 15000;
-const YTDLP_CONCURRENT_FRAGMENTS = parsePositiveEnvInt(process.env.YTDLP_CONCURRENT_FRAGMENTS, 4);
+const YTDLP_CONCURRENT_FRAGMENTS = parsePositiveEnvInt(process.env.YTDLP_CONCURRENT_FRAGMENTS, 8);
+const FILE_STREAM_HIGH_WATER_MARK = 1024 * 1024;
 const IFRAME_LIFETIME_MS = 120000;
 const JOB_TTL_MS = 30 * 60 * 1000;
 const JOB_SWEEP_INTERVAL_MS = 2 * 60 * 1000;  // sweep every 2 min instead of 10
@@ -560,6 +561,18 @@ function isH264(vcodec) {
   return typeof vcodec === "string" && vcodec.startsWith("avc1");
 }
 
+function isSafeProgressiveFormat(format) {
+  return !!(
+    format &&
+    format.format_id &&
+    format.ext === "mp4" &&
+    format.vcodec &&
+    format.vcodec !== "none" &&
+    format.acodec &&
+    format.acodec !== "none"
+  );
+}
+
 function parseFormats(rawFormats) {
   const byHeight = new Map(); // height -> { progressive, adaptive }
 
@@ -602,6 +615,7 @@ function parseFormats(rawFormats) {
   for (const [height, slot] of byHeight.entries()) {
     if (slot.progressive) {
       const format = slot.progressive;
+      const streamable = isSafeProgressiveFormat(format);
       // Use a resilient selector instead of the raw format_id.
       // Raw IDs (e.g. "22", "18") can disappear between /api/info and download time.
       videoFormats.push({
@@ -623,6 +637,8 @@ function parseFormats(rawFormats) {
         filesize: format.filesize || null,
         filesizeApprox: format.filesize_approx || null,
         sizeExact: false,
+        streamable,
+        streamFormatId: streamable ? String(format.format_id) : null,
         badge: height >= 1080 ? "HD" : "",
       });
       continue;
@@ -653,6 +669,8 @@ function parseFormats(rawFormats) {
         filesize: format.filesize || null,
         filesizeApprox: format.filesize_approx || null,
         sizeExact: false,
+        streamable: false,
+        streamFormatId: null,
         badge: height >= 1080 ? "HD" : "",
       });
     }
@@ -668,6 +686,8 @@ function parseFormats(rawFormats) {
       detail: "320kbps Audio",
       type: "audio",
       ext: "mp3",
+      streamable: false,
+      streamFormatId: null,
       badge: "Audio",
     },
   ];
@@ -905,6 +925,16 @@ function getFormatSelector(formatId, isAudio) {
     ? formatId
     : "bestvideo[vcodec^=avc1]+bestaudio[ext=m4a]/best[ext=mp4]";
   return preferM4aForMergedSelector(selector);
+}
+
+function isDirectStreamSafe(url, formatId, isAudio, ext) {
+  if (!url || !isValidYouTubeURL(url) || isPlaylistURL(url)) return false;
+  if (isAudio || ext !== "mp4") return false;
+
+  const selector = String(formatId || "").trim();
+  if (!selector || selector === "best" || selector === "bestaudio") return false;
+  if (/[+/\[\]()]/.test(selector)) return false;
+  return /^[A-Za-z0-9_.-]+$/.test(selector);
 }
 
 async function probeDownloadSize(url, formatId, isAudio) {
@@ -1600,12 +1630,93 @@ app.get("/api/download/file/:token", (req, res) => {
     if (!job.cleanupAt) scheduleJobCleanup(token);
   }
 
-  const fileStream = fs.createReadStream(job.filePath, { start, end });
+  const fileStream = fs.createReadStream(job.filePath, {
+    start,
+    end,
+    highWaterMark: FILE_STREAM_HIGH_WATER_MARK,
+  });
   fileStream.on("error", (err) => {
     if (!res.headersSent) res.status(500).json({ error: "File read failed: " + err.message });
     else res.destroy(err);
   });
   fileStream.pipe(res);
+});
+
+// GET /api/download/stream — fast path for progressive MP4 formats.
+// Adaptive video+audio and MP3 still use the background job path because they
+// need ffmpeg/post-processing before the final file is valid.
+app.get("/api/download/stream", directDownloadLimiter, async (req, res) => {
+  const url = normalizeRequestUrl(req.query.url);
+  const formatId = String(req.query.formatId || "").trim();
+  const ext = String(req.query.ext || "mp4").trim().toLowerCase();
+  const isAudio = ext === "mp3" || formatId === "bestaudio";
+
+  if (!url || !isValidYouTubeURL(url)) {
+    return res.status(400).json({ error: "Invalid or missing YouTube URL" });
+  }
+  if (!isDirectStreamSafe(url, formatId, isAudio, ext)) {
+    return res.status(409).json({
+      error: "This format needs the background downloader.",
+      fallback: "job",
+    });
+  }
+  if (MAX_DURATION_SECONDS || MAX_FILESIZE_BYTES) {
+    try {
+      await probeDownloadSize(url, formatId, false);
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+  }
+
+  const args = withCookies(buildDownloadArgs(formatId, false, "-"));
+  args.push(url);
+
+  const proc = spawn(YT_DLP, args, { stdio: ["ignore", "pipe", "pipe"] });
+  let stderr = "";
+  let sentBytes = 0;
+  let procClosed = false;
+
+  res.set({
+    "Content-Type": "video/mp4",
+    "Content-Disposition": buildContentDisposition("video.mp4"),
+    "Cache-Control": "no-store",
+  });
+
+  proc.stdout.on("data", (chunk) => {
+    sentBytes += chunk.length;
+  });
+  proc.stdout.pipe(res);
+
+  proc.stderr.on("data", (chunk) => {
+    const text = chunk.toString();
+    stderr += text;
+    const line = text.trim();
+    if (line) console.log("[yt-dlp:stream]", line);
+  });
+
+  proc.on("error", (err) => {
+    procClosed = true;
+    if (!res.headersSent && sentBytes === 0) {
+      return res.status(500).json({ error: "Stream failed: " + err.message.slice(0, 200) });
+    }
+    res.destroy(err);
+  });
+
+  proc.on("close", (code) => {
+    procClosed = true;
+    if (code === 0) return;
+    const msg = extractUsefulError(stderr, "yt-dlp exited with code " + code);
+    if (!res.headersSent && sentBytes === 0) {
+      return res.status(500).json({ error: "Stream failed: " + msg.slice(0, 200) });
+    }
+    if (!res.writableEnded) res.destroy(new Error(msg));
+  });
+
+  res.on("close", () => {
+    if (!procClosed && !res.writableEnded) {
+      try { proc.kill("SIGKILL"); } catch {}
+    }
+  });
 });
 
 // POST /api/download/cancel/:token — cancel an in-progress single-video job
@@ -1670,7 +1781,9 @@ async function streamDownload(req, res) {
       cleaned = true;
       removeDownloadArtifacts(producedPath);
     };
-    const fileStream = fs.createReadStream(producedPath);
+    const fileStream = fs.createReadStream(producedPath, {
+      highWaterMark: FILE_STREAM_HIGH_WATER_MARK,
+    });
     fileStream.on("error", (err) => {
       cleanup();
       if (!res.headersSent)
@@ -2181,7 +2294,11 @@ app.post("/api/download/playlist-zip", playlistZipLimiter, async (req, res) => {
     if (isPartial) res.status(206);
 
     // Stream ZIP to client; delete after transfer
-    const zipFileStream = fs.createReadStream(zipTempPath, { start, end });
+    const zipFileStream = fs.createReadStream(zipTempPath, {
+      start,
+      end,
+      highWaterMark: FILE_STREAM_HIGH_WATER_MARK,
+    });
     zipFileStream.on("error", (err) => {
       if (!res.headersSent) res.status(500).json({ error: "ZIP read failed: " + err.message });
       else res.destroy(err);
@@ -2269,7 +2386,11 @@ app.get("/api/download/playlist-zip/file/:id", (req, res) => {
   res.set(headers);
   if (isPartial) res.status(206);
 
-  const stream = fs.createReadStream(entry.path, { start, end });
+  const stream = fs.createReadStream(entry.path, {
+    start,
+    end,
+    highWaterMark: FILE_STREAM_HIGH_WATER_MARK,
+  });
   stream.on("error", (err) => {
     if (!res.headersSent) res.status(500).json({ error: "Read failed: " + err.message });
     else res.destroy(err);

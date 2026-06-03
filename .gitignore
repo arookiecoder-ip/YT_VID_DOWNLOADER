@@ -85,3 +85,5 @@ docker-compose.override.yml
 
 # Local accidental nested install folder
 /tubegrab-web-auth/
+# Added by code-review-graph
+.code-review-graph/

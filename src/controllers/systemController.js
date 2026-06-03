@@ -46,7 +46,14 @@ function createSystemController({
 
   function version(req, res) {
     let latest = 0;
-    for (const rel of ["server.js", "public/index.html"]) {
+    for (const rel of [
+      "server.js",
+      "src/app.js",
+      "src/controllers/systemController.js",
+      "public/index.html",
+      "public/assets/js/app.js",
+      "public/assets/css/styles.css",
+    ]) {
       try {
         const m = fs.statSync(path.join(rootDir, rel)).mtimeMs;
         if (m > latest) latest = m;
